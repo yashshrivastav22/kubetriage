@@ -5,23 +5,21 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - ops.kubetriage.dev
+  - ""
   resources:
-  - incidentpolicies
+  - pods
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - ops.kubetriage.dev
   resources:
-  - incidentpolicies/finalizers
+  - incidentpolicies
   verbs:
-  - update
+  - get
+  - list
+  - watch
 - apiGroups:
   - ops.kubetriage.dev
   resources:
