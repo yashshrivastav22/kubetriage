@@ -1,0 +1,9 @@
+apiVersion: ops.kubetriage.dev/v1alpha1
+kind: IncidentPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: kubetriage
+    app.kubernetes.io/managed-by: kustomize
+  name: incidentpolicy-sample
+spec:
+  # TODO(user): Add fields here
