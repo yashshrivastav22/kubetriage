@@ -28,11 +28,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -358,6 +362,83 @@ func (r *IncidentPolicyReconciler) updateStatusIfChanged(
 	)
 }
 
+// mapPodToIncidentPolicies maps a Pod event to every IncidentPolicy
+// in the same namespace whose selector matches that Pod.
+//
+// The Pod is a secondary watched resource. IncidentPolicy remains
+// the primary resource reconciled by this controller.
+func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
+	ctx context.Context,
+	obj client.Object,
+) []reconcile.Request {
+	log := logf.FromContext(ctx)
+
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+
+	policies := &opsv1alpha1.IncidentPolicyList{}
+
+	if err := r.List(
+		ctx,
+		policies,
+		client.InNamespace(pod.Namespace),
+	); err != nil {
+		log.Error(
+			err,
+			"failed to list IncidentPolicies for Pod event",
+			"pod",
+			pod.Name,
+			"namespace",
+			pod.Namespace,
+		)
+
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0)
+
+	for i := range policies.Items {
+		policy := &policies.Items[i]
+
+		selector, err := metav1.LabelSelectorAsSelector(
+			&policy.Spec.Selector,
+		)
+
+		if err != nil {
+			log.Error(
+				err,
+				"failed to convert IncidentPolicy selector",
+				"policy",
+				policy.Name,
+				"namespace",
+				policy.Namespace,
+			)
+
+			continue
+		}
+
+		if !selector.Matches(
+			labels.Set(pod.Labels),
+		) {
+			continue
+		}
+
+		requests = append(
+			requests,
+			reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      policy.Name,
+					Namespace: policy.Namespace,
+				},
+			},
+		)
+	}
+
+	return requests
+}
+
 // SetupWithManager registers IncidentPolicy as the primary resource watched
 // by this controller.
 //
@@ -367,6 +448,12 @@ func (r *IncidentPolicyReconciler) SetupWithManager(
 ) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&opsv1alpha1.IncidentPolicy{}).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(
+				r.mapPodToIncidentPolicies,
+			),
+		).
 		Named("incidentpolicy").
 		Complete(r)
 }
