@@ -36,17 +36,11 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 	})
 
 	// ---------------------------------------------------------------------
-	// TEST 1:
-	// No Pods match the policy selector.
-	//
-	// Expected:
-	// - monitoredPods = 0
-	// - IncidentDetected = Unknown
-	// - reason = NoMatchingPods
+	// TEST 1
+	// No Pods match the selector.
 	// ---------------------------------------------------------------------
 
 	It("reports Unknown when no Pods match the selector", func() {
-
 		policy := &opsv1alpha1.IncidentPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "no-matching-pods",
@@ -128,18 +122,12 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 	})
 
 	// ---------------------------------------------------------------------
-	// TEST 2:
-	// A healthy Pod matches the selector.
-	//
-	// An unrelated crashing Pod also exists, but the controller must ignore it.
-	//
-	// Expected:
-	// - monitoredPods = 1
-	// - IncidentDetected = False
+	// TEST 2
+	// Healthy matching Pod.
+	// Unrelated crashing Pod must be ignored.
 	// ---------------------------------------------------------------------
 
 	It("counts only matching Pods and reports no incident", func() {
-
 		createTestPod(
 			"checkout-healthy",
 			map[string]string{
@@ -150,7 +138,6 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 			},
 		)
 
-		// This Pod is crashing, but its labels do not match the policy.
 		createTestPod(
 			"payment-crashing",
 			map[string]string{
@@ -212,16 +199,11 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 	})
 
 	// ---------------------------------------------------------------------
-	// TEST 3:
-	// A matching Pod has a container in CrashLoopBackOff.
-	//
-	// Expected:
-	// - IncidentDetected = True
-	// - reason = CrashLoopBackOffDetected
+	// TEST 3
+	// CrashLoopBackOff detection.
 	// ---------------------------------------------------------------------
 
 	It("detects CrashLoopBackOff in a matching Pod", func() {
-
 		createTestPod(
 			"checkout-crashing",
 			map[string]string{
@@ -291,19 +273,11 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 	})
 
 	// ---------------------------------------------------------------------
-	// TEST 4:
-	// A matching Pod previously terminated because of OOMKilled.
-	//
-	// The container is currently running again, but Kubernetes reports the
-	// previous OOM termination through LastTerminationState.
-	//
-	// Expected:
-	// - IncidentDetected = True
-	// - reason = OOMKilledDetected
+	// TEST 4
+	// OOMKilled detection.
 	// ---------------------------------------------------------------------
 
 	It("detects OOMKilled in a matching Pod", func() {
-
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "checkout-oom",
@@ -327,8 +301,6 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 			k8sClient.Create(ctx, pod),
 		).To(Succeed())
 
-		// Simulate what kubelet would report after Kubernetes
-		// restarts a container that was OOMKilled.
 		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
 			{
 				Name: "app",
@@ -409,40 +381,34 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 	})
 
 	// ---------------------------------------------------------------------
-	// TEST 5:
-	// ImagePull exists in the API but has not been implemented yet.
-	//
-	// We must NOT incorrectly report NoIncidentDetected.
-	//
-	// Expected:
-	// - Ready = False
-	// - reason = UnsupportedChecks
-	// - IncidentDetected = Unknown
-	// - reason = PartialEvaluation
+	// TEST 5
+	// ImagePullBackOff detection.
 	// ---------------------------------------------------------------------
 
-	It("reports partial evaluation for checks not implemented yet", func() {
-
+	It("detects ImagePullBackOff in a matching Pod", func() {
 		createTestPod(
-			"unsupported-check-pod",
+			"checkout-image-failure",
 			map[string]string{
-				"app": "unsupported-check-test",
+				"app": "checkout-image-test",
 			},
 			corev1.ContainerState{
-				Running: &corev1.ContainerStateRunning{},
+				Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				},
 			},
 		)
 
 		policy := &opsv1alpha1.IncidentPolicy{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "unsupported-policy",
+				Name:      "image-policy",
 				Namespace: controllerTestNamespace,
 			},
 
 			Spec: opsv1alpha1.IncidentPolicySpec{
 				Selector: metav1.LabelSelector{
 					MatchLabels: map[string]string{
-						"app": "unsupported-check-test",
+						"app": "checkout-image-test",
 					},
 				},
 
@@ -460,6 +426,10 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 			policy.Name,
 		)
 
+		Expect(
+			updated.Status.MonitoredPods,
+		).To(Equal(int32(1)))
+
 		ready := apimeta.FindStatusCondition(
 			updated.Status.Conditions,
 			conditionTypeReady,
@@ -468,11 +438,11 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 		Expect(ready).NotTo(BeNil())
 
 		Expect(ready.Status).To(
-			Equal(metav1.ConditionFalse),
+			Equal(metav1.ConditionTrue),
 		)
 
 		Expect(ready.Reason).To(
-			Equal("UnsupportedChecks"),
+			Equal("EvaluationReady"),
 		)
 
 		incident := apimeta.FindStatusCondition(
@@ -483,20 +453,99 @@ var _ = Describe("IncidentPolicy reconciliation", func() {
 		Expect(incident).NotTo(BeNil())
 
 		Expect(incident.Status).To(
-			Equal(metav1.ConditionUnknown),
+			Equal(metav1.ConditionTrue),
 		)
 
 		Expect(incident.Reason).To(
-			Equal("PartialEvaluation"),
+			Equal("ImagePullBackOffDetected"),
+		)
+
+		Expect(incident.Message).To(
+			ContainSubstring("checkout-image-failure"),
+		)
+
+		Expect(incident.Message).To(
+			ContainSubstring("app"),
+		)
+	})
+
+	// ---------------------------------------------------------------------
+	// TEST 6
+	// ErrImagePull detection.
+	// ---------------------------------------------------------------------
+
+	It("detects ErrImagePull in a matching Pod", func() {
+		createTestPod(
+			"checkout-bad-image",
+			map[string]string{
+				"app": "checkout-err-image-test",
+			},
+			corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "ErrImagePull",
+					Message: "failed to pull image",
+				},
+			},
+		)
+
+		policy := &opsv1alpha1.IncidentPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "err-image-policy",
+				Namespace: controllerTestNamespace,
+			},
+
+			Spec: opsv1alpha1.IncidentPolicySpec{
+				Selector: metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "checkout-err-image-test",
+					},
+				},
+
+				Checks: opsv1alpha1.IncidentChecks{
+					ImagePull: true,
+				},
+			},
+		}
+
+		Expect(
+			k8sClient.Create(ctx, policy),
+		).To(Succeed())
+
+		updated := reconcilePolicy(
+			policy.Name,
+		)
+
+		Expect(
+			updated.Status.MonitoredPods,
+		).To(Equal(int32(1)))
+
+		incident := apimeta.FindStatusCondition(
+			updated.Status.Conditions,
+			conditionTypeIncidentDetected,
+		)
+
+		Expect(incident).NotTo(BeNil())
+
+		Expect(incident.Status).To(
+			Equal(metav1.ConditionTrue),
+		)
+
+		Expect(incident.Reason).To(
+			Equal("ErrImagePullDetected"),
+		)
+
+		Expect(incident.Message).To(
+			ContainSubstring("checkout-bad-image"),
+		)
+
+		Expect(incident.Message).To(
+			ContainSubstring("app"),
 		)
 	})
 })
 
-// createTestPod creates a Pod through envtest and then simulates
-// the container state that kubelet would normally publish.
-//
-// envtest runs the Kubernetes API server and etcd but does not run kubelet,
-// so container status must be supplied explicitly in controller tests.
+// createTestPod creates a Pod through envtest and simulates the container
+// status that kubelet would normally publish.
 func createTestPod(
 	name string,
 	labels map[string]string,
@@ -538,8 +587,8 @@ func createTestPod(
 	).To(Succeed())
 }
 
-// reconcilePolicy runs the real IncidentPolicy reconciler and then
-// retrieves the resulting IncidentPolicy from the envtest API server.
+// reconcilePolicy executes the real IncidentPolicy reconciler and then
+// retrieves the resulting IncidentPolicy from envtest.
 func reconcilePolicy(
 	policyName string,
 ) *opsv1alpha1.IncidentPolicy {

@@ -1,26 +1,9 @@
-/*
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
 	"fmt"
 	"reflect"
-	"strings"
 	"time"
 
 	opsv1alpha1 "github.com/yashshrivastav22/kubetriage/api/v1alpha1"
@@ -44,6 +27,7 @@ const (
 	conditionTypeIncidentDetected = "IncidentDetected"
 )
 
+// incidentFinding represents one detected incident condition.
 type incidentFinding struct {
 	Pod       string
 	Container string
@@ -57,28 +41,54 @@ type IncidentPolicyReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+// -----------------------------------------------------------------------------
+// RBAC
+//
+// KubeTriage can:
+// - read IncidentPolicies
+// - update IncidentPolicy status
+// - read/watch Pods
+//
+// KubeTriage cannot modify monitored Pods.
+// -----------------------------------------------------------------------------
+
 // +kubebuilder:rbac:groups=ops.kubetriage.dev,resources=incidentpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ops.kubetriage.dev,resources=incidentpolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
+// Reconcile evaluates the IncidentPolicy against Pods matching its selector.
 func (r *IncidentPolicyReconciler) Reconcile(
 	ctx context.Context,
 	req ctrl.Request,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// STEP 1: Retrieve the IncidentPolicy.
+	// ---------------------------------------------------------------------
+	// STEP 1:
+	// Retrieve the IncidentPolicy.
+	// ---------------------------------------------------------------------
+
 	policy := &opsv1alpha1.IncidentPolicy{}
 
-	if err := r.Get(ctx, req.NamespacedName, policy); err != nil {
+	if err := r.Get(
+		ctx,
+		req.NamespacedName,
+		policy,
+	); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Save the original object so we can avoid unnecessary status writes.
 	before := policy.DeepCopy()
 
 	policy.Status.ObservedGeneration = policy.Generation
 
-	// STEP 2: Convert the LabelSelector.
+	// ---------------------------------------------------------------------
+	// STEP 2:
+	// Convert the Kubernetes LabelSelector into a selector that can be used
+	// when listing Pods.
+	// ---------------------------------------------------------------------
+
 	selector, err := metav1.LabelSelectorAsSelector(
 		&policy.Spec.Selector,
 	)
@@ -119,7 +129,11 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		return ctrl.Result{}, nil
 	}
 
-	// STEP 3: Find matching Pods.
+	// ---------------------------------------------------------------------
+	// STEP 3:
+	// Find Pods in the same namespace that match the policy selector.
+	// ---------------------------------------------------------------------
+
 	pods := &corev1.PodList{}
 
 	if err := r.List(
@@ -133,7 +147,9 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		return ctrl.Result{}, err
 	}
 
-	policy.Status.MonitoredPods = int32(len(pods.Items))
+	policy.Status.MonitoredPods = int32(
+		len(pods.Items),
+	)
 
 	log.Info(
 		"evaluating IncidentPolicy",
@@ -145,7 +161,11 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		len(pods.Items),
 	)
 
-	// STEP 4: Handle no matching Pods.
+	// ---------------------------------------------------------------------
+	// STEP 4:
+	// If no Pods match, KubeTriage cannot determine application health.
+	// ---------------------------------------------------------------------
+
 	if len(pods.Items) == 0 {
 		apimeta.SetStatusCondition(
 			&policy.Status.Conditions,
@@ -182,47 +202,36 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		}, nil
 	}
 
-	// STEP 5: Identify checks that are not implemented yet.
+	// ---------------------------------------------------------------------
+	// STEP 5:
+	// All V1 checks are currently implemented.
+	// ---------------------------------------------------------------------
+
+	apimeta.SetStatusCondition(
+		&policy.Status.Conditions,
+		metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: policy.Generation,
+			Reason:             "EvaluationReady",
+			Message:            "All configured incident checks can be evaluated.",
+		},
+	)
+
+	// ---------------------------------------------------------------------
+	// STEP 6:
+	// Run the configured detectors.
 	//
-	// CrashLoopBackOff and OOMKilled are now supported.
-	// ImagePull is still pending.
-	var unsupportedChecks []string
+	// Current priority:
+	//
+	// 1. CrashLoopBackOff
+	// 2. OOMKilled
+	// 3. Image pull failures
+	//
+	// For now, KubeTriage reports the first finding.
+	// Later IncidentReport support will allow multiple simultaneous findings.
+	// ---------------------------------------------------------------------
 
-	if policy.Spec.Checks.ImagePull {
-		unsupportedChecks = append(
-			unsupportedChecks,
-			"imagePull",
-		)
-	}
-
-	if len(unsupportedChecks) > 0 {
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeReady,
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: policy.Generation,
-				Reason:             "UnsupportedChecks",
-				Message: fmt.Sprintf(
-					"Checks not implemented yet: %s",
-					strings.Join(unsupportedChecks, ", "),
-				),
-			},
-		)
-	} else {
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeReady,
-				Status:             metav1.ConditionTrue,
-				ObservedGeneration: policy.Generation,
-				Reason:             "EvaluationReady",
-				Message:            "All configured incident checks can be evaluated.",
-			},
-		)
-	}
-
-	// STEP 6: Run supported detectors.
 	var finding *incidentFinding
 
 	if policy.Spec.Checks.CrashLoop {
@@ -231,15 +240,26 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		)
 	}
 
-	if finding == nil && policy.Spec.Checks.OOMKilled {
+	if finding == nil &&
+		policy.Spec.Checks.OOMKilled {
 		finding = findOOMKilled(
 			pods.Items,
 		)
 	}
 
-	// STEP 7: Publish incident state.
-	switch {
-	case finding != nil:
+	if finding == nil &&
+		policy.Spec.Checks.ImagePull {
+		finding = findImagePullFailure(
+			pods.Items,
+		)
+	}
+
+	// ---------------------------------------------------------------------
+	// STEP 7:
+	// Publish the result.
+	// ---------------------------------------------------------------------
+
+	if finding != nil {
 		apimeta.SetStatusCondition(
 			&policy.Status.Conditions,
 			metav1.Condition{
@@ -250,20 +270,7 @@ func (r *IncidentPolicyReconciler) Reconcile(
 				Message:            finding.Message,
 			},
 		)
-
-	case len(unsupportedChecks) > 0:
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeIncidentDetected,
-				Status:             metav1.ConditionUnknown,
-				ObservedGeneration: policy.Generation,
-				Reason:             "PartialEvaluation",
-				Message:            "No supported incident condition was detected, but one or more configured checks are not implemented yet.",
-			},
-		)
-
-	default:
+	} else {
 		apimeta.SetStatusCondition(
 			&policy.Status.Conditions,
 			metav1.Condition{
@@ -276,7 +283,11 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		)
 	}
 
-	// STEP 8: Write status only if it actually changed.
+	// ---------------------------------------------------------------------
+	// STEP 8:
+	// Update status only when the status actually changed.
+	// ---------------------------------------------------------------------
+
 	if err := r.updateStatusIfChanged(
 		ctx,
 		before,
@@ -285,13 +296,25 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		return ctrl.Result{}, err
 	}
 
-	// STEP 9: Periodic fallback reconciliation.
+	// ---------------------------------------------------------------------
+	// STEP 9:
+	// Periodic fallback reconciliation.
+	//
+	// Pod watches provide event-driven reconciliation, but this periodic
+	// reconciliation gives us an additional eventual-consistency mechanism.
+	// ---------------------------------------------------------------------
+
 	return ctrl.Result{
 		RequeueAfter: 30 * time.Second,
 	}, nil
 }
 
-// findCrashLoopBackOff searches regular and init containers.
+// -----------------------------------------------------------------------------
+// CrashLoopBackOff detector
+// -----------------------------------------------------------------------------
+
+// findCrashLoopBackOff searches regular containers and init containers for
+// the CrashLoopBackOff waiting reason.
 func findCrashLoopBackOff(
 	pods []corev1.Pod,
 ) *incidentFinding {
@@ -305,23 +328,26 @@ func findCrashLoopBackOff(
 
 		for _, statuses := range statusGroups {
 			for _, containerStatus := range statuses {
-				waiting := containerStatus.State.Waiting
+				waiting :=
+					containerStatus.State.Waiting
 
 				if waiting == nil {
 					continue
 				}
 
-				if waiting.Reason == "CrashLoopBackOff" {
-					return &incidentFinding{
-						Pod:       pod.Name,
-						Container: containerStatus.Name,
-						Reason:    "CrashLoopBackOff",
-						Message: fmt.Sprintf(
-							"Pod %s container %s is in CrashLoopBackOff.",
-							pod.Name,
-							containerStatus.Name,
-						),
-					}
+				if waiting.Reason != "CrashLoopBackOff" {
+					continue
+				}
+
+				return &incidentFinding{
+					Pod:       pod.Name,
+					Container: containerStatus.Name,
+					Reason:    "CrashLoopBackOff",
+					Message: fmt.Sprintf(
+						"Pod %s container %s is in CrashLoopBackOff.",
+						pod.Name,
+						containerStatus.Name,
+					),
 				}
 			}
 		}
@@ -330,10 +356,15 @@ func findCrashLoopBackOff(
 	return nil
 }
 
-// findOOMKilled searches regular and init containers for an OOM termination.
+// -----------------------------------------------------------------------------
+// OOMKilled detector
+// -----------------------------------------------------------------------------
+
+// findOOMKilled searches regular containers and init containers for an
+// OOMKilled termination.
 //
-// We inspect both the current terminated state and the previous terminated
-// state because Kubernetes may restart a container after an OOM event.
+// Kubernetes may restart the container after the OOM event, so we inspect
+// both the current terminated state and LastTerminationState.
 func findOOMKilled(
 	pods []corev1.Pod,
 ) *incidentFinding {
@@ -375,6 +406,8 @@ func findOOMKilled(
 	return nil
 }
 
+// newOOMKilledFinding creates the normalized finding returned by the
+// OOMKilled detector.
 func newOOMKilledFinding(
 	podName string,
 	containerName string,
@@ -391,7 +424,68 @@ func newOOMKilledFinding(
 	}
 }
 
-// updateStatusIfChanged avoids unnecessary Kubernetes API writes.
+// -----------------------------------------------------------------------------
+// Image pull detector
+// -----------------------------------------------------------------------------
+
+// findImagePullFailure detects image-pull failures reported through the
+// container waiting state.
+//
+// Kubernetes commonly reports:
+//
+// - ErrImagePull
+// - ImagePullBackOff
+func findImagePullFailure(
+	pods []corev1.Pod,
+) *incidentFinding {
+	for i := range pods {
+		pod := &pods[i]
+
+		statusGroups := [][]corev1.ContainerStatus{
+			pod.Status.InitContainerStatuses,
+			pod.Status.ContainerStatuses,
+		}
+
+		for _, statuses := range statusGroups {
+			for _, containerStatus := range statuses {
+				waiting :=
+					containerStatus.State.Waiting
+
+				if waiting == nil {
+					continue
+				}
+
+				switch waiting.Reason {
+				case "ErrImagePull",
+					"ImagePullBackOff":
+
+					return &incidentFinding{
+						Pod:       pod.Name,
+						Container: containerStatus.Name,
+						Reason:    waiting.Reason,
+						Message: fmt.Sprintf(
+							"Pod %s container %s cannot pull its image: %s.",
+							pod.Name,
+							containerStatus.Name,
+							waiting.Reason,
+						),
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Status update helper
+// -----------------------------------------------------------------------------
+
+// updateStatusIfChanged prevents unnecessary writes to the Kubernetes API.
+//
+// Reconciliation can happen repeatedly, so we avoid patching status when the
+// calculated status already matches what Kubernetes stores.
 func (r *IncidentPolicyReconciler) updateStatusIfChanged(
 	ctx context.Context,
 	before *opsv1alpha1.IncidentPolicy,
@@ -411,8 +505,15 @@ func (r *IncidentPolicyReconciler) updateStatusIfChanged(
 	)
 }
 
-// mapPodToIncidentPolicies converts a Pod event into reconcile requests
-// for every IncidentPolicy in the same namespace whose selector matches it.
+// -----------------------------------------------------------------------------
+// Pod event mapping
+// -----------------------------------------------------------------------------
+
+// mapPodToIncidentPolicies maps a Pod event to all IncidentPolicies in the
+// same namespace whose selector matches that Pod.
+//
+// IncidentPolicy remains the primary resource reconciled by this controller.
+// Pods are secondary watched resources.
 func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	ctx context.Context,
 	obj client.Object,
@@ -430,7 +531,9 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	if err := r.List(
 		ctx,
 		policies,
-		client.InNamespace(pod.Namespace),
+		client.InNamespace(
+			pod.Namespace,
+		),
 	); err != nil {
 		log.Error(
 			err,
@@ -444,14 +547,18 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 		return nil
 	}
 
-	requests := make([]reconcile.Request, 0)
+	requests := make(
+		[]reconcile.Request,
+		0,
+	)
 
 	for i := range policies.Items {
 		policy := &policies.Items[i]
 
-		selector, err := metav1.LabelSelectorAsSelector(
-			&policy.Spec.Selector,
-		)
+		selector, err :=
+			metav1.LabelSelectorAsSelector(
+				&policy.Spec.Selector,
+			)
 
 		if err != nil {
 			log.Error(
@@ -486,19 +593,37 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	return requests
 }
 
-// SetupWithManager registers IncidentPolicy as the primary resource and Pods
-// as a secondary watched resource.
+// -----------------------------------------------------------------------------
+// Controller registration
+// -----------------------------------------------------------------------------
+
+// SetupWithManager registers:
+//
+// IncidentPolicy
+//
+//	Primary watched resource.
+//
+// Pod
+//
+//	Secondary watched resource.
+//
+// When a Pod changes, mapPodToIncidentPolicies determines which policies need
+// to be reconciled.
 func (r *IncidentPolicyReconciler) SetupWithManager(
 	mgr ctrl.Manager,
 ) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&opsv1alpha1.IncidentPolicy{}).
+		For(
+			&opsv1alpha1.IncidentPolicy{},
+		).
 		Watches(
 			&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(
 				r.mapPodToIncidentPolicies,
 			),
 		).
-		Named("incidentpolicy").
+		Named(
+			"incidentpolicy",
+		).
 		Complete(r)
 }
