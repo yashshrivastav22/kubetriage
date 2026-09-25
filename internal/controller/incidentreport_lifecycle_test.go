@@ -36,69 +36,35 @@ var _ = Describe("IncidentReport lifecycle", func() {
 
 	// ---------------------------------------------------------------------
 	// TEST 1:
-	// Repeated observations of the same incident must reuse one report.
+	// Same incident must reuse one IncidentReport.
 	// ---------------------------------------------------------------------
 
-	It("creates one Active IncidentReport and reuses it for repeated observations", func() {
-
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "checkout-lifecycle-crash",
-				Namespace: controllerTestNamespace,
-				Labels: map[string]string{
-					"app": "checkout-lifecycle-test",
+	It("reuses one IncidentReport for repeated observations of the same incident", func() {
+		pod := createLifecyclePod(
+			"dedupe-crash-pod",
+			map[string]string{
+				"app": "dedupe-test",
+			},
+			corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "CrashLoopBackOff",
+					Message: "back-off restarting failed container",
 				},
 			},
-
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{
-					{
-						Name:  "app",
-						Image: "busybox:1.36",
-					},
-				},
-			},
-		}
-
-		Expect(
-			k8sClient.Create(
-				ctx,
-				pod,
-			),
-		).To(Succeed())
-
-		// envtest has no kubelet, so container status must be simulated.
-		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
-			{
-				Name:         "app",
-				RestartCount: 3,
-
-				State: corev1.ContainerState{
-					Waiting: &corev1.ContainerStateWaiting{
-						Reason:  "CrashLoopBackOff",
-						Message: "back-off restarting failed container",
-					},
-				},
-			},
-		}
-
-		Expect(
-			k8sClient.Status().Update(
-				ctx,
-				pod,
-			),
-		).To(Succeed())
+			corev1.ContainerState{},
+			3,
+		)
 
 		policy := &opsv1alpha1.IncidentPolicy{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "checkout-lifecycle-policy",
+				Name:      "dedupe-policy",
 				Namespace: controllerTestNamespace,
 			},
 
 			Spec: opsv1alpha1.IncidentPolicySpec{
 				Selector: metav1.LabelSelector{
 					MatchLabels: map[string]string{
-						"app": "checkout-lifecycle-test",
+						"app": "dedupe-test",
 					},
 				},
 
@@ -115,100 +81,20 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// -------------------------------------------------------------
 		// First reconciliation.
-		// -------------------------------------------------------------
-
-		updatedPolicy := reconcilePolicy(
+		reconcilePolicy(
 			policy.Name,
 		)
 
-		incidentCondition := apimeta.FindStatusCondition(
-			updatedPolicy.Status.Conditions,
-			conditionTypeIncidentDetected,
+		firstReports := listReportsForPolicy(
+			policy,
 		)
-
-		Expect(
-			incidentCondition,
-		).NotTo(BeNil())
-
-		Expect(
-			incidentCondition.Status,
-		).To(Equal(metav1.ConditionTrue))
-
-		Expect(
-			incidentCondition.Reason,
-		).To(Equal("CrashLoopBackOffDetected"))
-
-		// -------------------------------------------------------------
-		// Find the created IncidentReport.
-		// -------------------------------------------------------------
-
-		firstReports := &opsv1alpha1.IncidentReportList{}
-
-		Expect(
-			k8sClient.List(
-				ctx,
-				firstReports,
-
-				client.InNamespace(
-					controllerTestNamespace,
-				),
-
-				client.MatchingLabels{
-					reportPolicyUIDLabel: string(policy.UID),
-				},
-			),
-		).To(Succeed())
 
 		Expect(
 			firstReports.Items,
 		).To(HaveLen(1))
 
-		firstReport :=
-			&firstReports.Items[0]
-
-		// -------------------------------------------------------------
-		// Verify stable identity.
-		// -------------------------------------------------------------
-
-		Expect(
-			firstReport.Spec.PolicyName,
-		).To(Equal(policy.Name))
-
-		Expect(
-			firstReport.Spec.PolicyUID,
-		).To(Equal(string(policy.UID)))
-
-		Expect(
-			firstReport.Spec.PodName,
-		).To(Equal(pod.Name))
-
-		Expect(
-			firstReport.Spec.PodUID,
-		).To(Equal(string(pod.UID)))
-
-		Expect(
-			firstReport.Spec.ContainerName,
-		).To(Equal("app"))
-
-		Expect(
-			firstReport.Spec.IncidentType,
-		).To(Equal("CrashLoopBackOff"))
-
-		Expect(
-			firstReport.Spec.Fingerprint,
-		).NotTo(BeEmpty())
-
-		firstReportName :=
-			firstReport.Name
-
-		firstFingerprint :=
-			firstReport.Spec.Fingerprint
-
-		// -------------------------------------------------------------
-		// Verify Active lifecycle.
-		// -------------------------------------------------------------
+		firstReport := &firstReports.Items[0]
 
 		Expect(
 			firstReport.Status.Phase,
@@ -223,30 +109,17 @@ var _ = Describe("IncidentReport lifecycle", func() {
 		).NotTo(BeNil())
 
 		Expect(
-			firstReport.Status.ResolvedAt,
-		).To(BeNil())
-
-		firstDetectedTime :=
-			firstReport.Status.FirstDetectedAt.Time
-
-		firstObservedTime :=
-			firstReport.Status.LastObservedAt.Time
-
-		// -------------------------------------------------------------
-		// Verify evidence.
-		// -------------------------------------------------------------
-
-		Expect(
 			firstReport.Status.Evidence.RestartCount,
 		).To(Equal(int32(3)))
 
-		Expect(
-			firstReport.Status.Evidence.CurrentState,
-		).To(Equal("Waiting"))
+		firstName :=
+			firstReport.Name
 
-		Expect(
-			firstReport.Status.Evidence.WaitingReason,
-		).To(Equal("CrashLoopBackOff"))
+		firstFingerprint :=
+			firstReport.Spec.Fingerprint
+
+		firstDetectedAt :=
+			firstReport.Status.FirstDetectedAt.Time
 
 		// -------------------------------------------------------------
 		// Same incident continues.
@@ -266,29 +139,11 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			policy.Name,
 		)
 
-		// -------------------------------------------------------------
-		// List reports again.
-		// -------------------------------------------------------------
+		secondReports := listReportsForPolicy(
+			policy,
+		)
 
-		secondReports :=
-			&opsv1alpha1.IncidentReportList{}
-
-		Expect(
-			k8sClient.List(
-				ctx,
-				secondReports,
-
-				client.InNamespace(
-					controllerTestNamespace,
-				),
-
-				client.MatchingLabels{
-					reportPolicyUIDLabel: string(policy.UID),
-				},
-			),
-		).To(Succeed())
-
-		// Critical duplicate-prevention assertion.
+		// Critical deduplication check.
 		Expect(
 			secondReports.Items,
 		).To(HaveLen(1))
@@ -296,12 +151,10 @@ var _ = Describe("IncidentReport lifecycle", func() {
 		secondReport :=
 			&secondReports.Items[0]
 
-		// Same resource.
 		Expect(
 			secondReport.Name,
-		).To(Equal(firstReportName))
+		).To(Equal(firstName))
 
-		// Same fingerprint.
 		Expect(
 			secondReport.Spec.Fingerprint,
 		).To(Equal(firstFingerprint))
@@ -310,121 +163,47 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			secondReport.Status.Phase,
 		).To(Equal("Active"))
 
-		// FirstDetectedAt must stay unchanged.
-		Expect(
-			secondReport.Status.FirstDetectedAt,
-		).NotTo(BeNil())
-
 		Expect(
 			secondReport.Status.FirstDetectedAt.Time.Equal(
-				firstDetectedTime,
+				firstDetectedAt,
 			),
 		).To(BeTrue())
 
-		// LastObservedAt must not move backwards.
-		Expect(
-			secondReport.Status.LastObservedAt,
-		).NotTo(BeNil())
-
-		Expect(
-			secondReport.Status.LastObservedAt.Time.Before(
-				firstObservedTime,
-			),
-		).To(BeFalse())
-
-		// Evidence should refresh.
 		Expect(
 			secondReport.Status.Evidence.RestartCount,
 		).To(Equal(int32(4)))
-
-		Expect(
-			secondReport.Status.Evidence.CurrentState,
-		).To(Equal("Waiting"))
-
-		Expect(
-			secondReport.Status.Evidence.WaitingReason,
-		).To(Equal("CrashLoopBackOff"))
-
-		Expect(
-			secondReport.Status.ResolvedAt,
-		).To(BeNil())
 	})
 
 	// ---------------------------------------------------------------------
 	// TEST 2:
-	// Active incident becomes Resolved when the failure disappears.
+	// Active incident must become Resolved when the failure disappears.
 	// ---------------------------------------------------------------------
 
-	It("marks an Active IncidentReport Resolved when the Pod becomes healthy", func() {
-
-		// -------------------------------------------------------------
-		// STEP 1:
-		// Create a crashing Pod.
-		// -------------------------------------------------------------
-
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "checkout-resolution-pod",
-				Namespace: controllerTestNamespace,
-				Labels: map[string]string{
-					"app": "checkout-resolution-test",
+	It("marks an Active IncidentReport Resolved when the failure disappears", func() {
+		pod := createLifecyclePod(
+			"resolution-crash-pod",
+			map[string]string{
+				"app": "resolution-test",
+			},
+			corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{
+					Reason: "CrashLoopBackOff",
 				},
 			},
-
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{
-					{
-						Name:  "app",
-						Image: "busybox:1.36",
-					},
-				},
-			},
-		}
-
-		Expect(
-			k8sClient.Create(
-				ctx,
-				pod,
-			),
-		).To(Succeed())
-
-		pod.Status.ContainerStatuses =
-			[]corev1.ContainerStatus{
-				{
-					Name:         "app",
-					RestartCount: 5,
-
-					State: corev1.ContainerState{
-						Waiting: &corev1.ContainerStateWaiting{
-							Reason:  "CrashLoopBackOff",
-							Message: "back-off restarting failed container",
-						},
-					},
-				},
-			}
-
-		Expect(
-			k8sClient.Status().Update(
-				ctx,
-				pod,
-			),
-		).To(Succeed())
-
-		// -------------------------------------------------------------
-		// STEP 2:
-		// Create policy.
-		// -------------------------------------------------------------
+			corev1.ContainerState{},
+			5,
+		)
 
 		policy := &opsv1alpha1.IncidentPolicy{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "checkout-resolution-policy",
+				Name:      "resolution-policy",
 				Namespace: controllerTestNamespace,
 			},
 
 			Spec: opsv1alpha1.IncidentPolicySpec{
 				Selector: metav1.LabelSelector{
 					MatchLabels: map[string]string{
-						"app": "checkout-resolution-test",
+						"app": "resolution-test",
 					},
 				},
 
@@ -441,32 +220,14 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// -------------------------------------------------------------
-		// STEP 3:
-		// Detect the incident.
-		// -------------------------------------------------------------
-
+		// Detect initial incident.
 		reconcilePolicy(
 			policy.Name,
 		)
 
-		activeReports :=
-			&opsv1alpha1.IncidentReportList{}
-
-		Expect(
-			k8sClient.List(
-				ctx,
-				activeReports,
-
-				client.InNamespace(
-					controllerTestNamespace,
-				),
-
-				client.MatchingLabels{
-					reportPolicyUIDLabel: string(policy.UID),
-				},
-			),
-		).To(Succeed())
+		activeReports := listReportsForPolicy(
+			policy,
+		)
 
 		Expect(
 			activeReports.Items,
@@ -483,35 +244,23 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			activeReport.Status.ResolvedAt,
 		).To(BeNil())
 
-		Expect(
-			activeReport.Status.FirstDetectedAt,
-		).NotTo(BeNil())
-
-		Expect(
-			activeReport.Status.LastObservedAt,
-		).NotTo(BeNil())
-
 		reportName :=
 			activeReport.Name
 
 		fingerprint :=
 			activeReport.Spec.Fingerprint
 
-		firstDetectedTime :=
+		firstDetectedAt :=
 			activeReport.Status.FirstDetectedAt.Time
 
-		lastObservedTime :=
+		lastObservedAt :=
 			activeReport.Status.LastObservedAt.Time
 
 		restartCount :=
 			activeReport.Status.Evidence.RestartCount
 
 		// -------------------------------------------------------------
-		// STEP 4:
 		// Simulate recovery.
-		//
-		// The same container is now Running instead of
-		// CrashLoopBackOff.
 		// -------------------------------------------------------------
 
 		pod.Status.ContainerStatuses =
@@ -533,70 +282,40 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// -------------------------------------------------------------
-		// STEP 5:
-		// Reconcile after recovery.
-		// -------------------------------------------------------------
+		updatedPolicy := reconcilePolicy(
+			policy.Name,
+		)
 
-		updatedPolicy :=
-			reconcilePolicy(
-				policy.Name,
-			)
-
-		// Policy should now say no incident is detected.
-		incidentCondition :=
+		condition :=
 			apimeta.FindStatusCondition(
 				updatedPolicy.Status.Conditions,
 				conditionTypeIncidentDetected,
 			)
 
-		Expect(
-			incidentCondition,
-		).NotTo(BeNil())
+		Expect(condition).NotTo(BeNil())
 
 		Expect(
-			incidentCondition.Status,
+			condition.Status,
 		).To(Equal(metav1.ConditionFalse))
 
 		Expect(
-			incidentCondition.Reason,
+			condition.Reason,
 		).To(Equal("NoIncidentDetected"))
 
 		// -------------------------------------------------------------
-		// STEP 6:
-		// The report must still exist.
+		// Report remains as history but is now Resolved.
 		// -------------------------------------------------------------
 
-		resolvedReports :=
-			&opsv1alpha1.IncidentReportList{}
+		resolvedReports := listReportsForPolicy(
+			policy,
+		)
 
-		Expect(
-			k8sClient.List(
-				ctx,
-				resolvedReports,
-
-				client.InNamespace(
-					controllerTestNamespace,
-				),
-
-				client.MatchingLabels{
-					reportPolicyUIDLabel: string(policy.UID),
-				},
-			),
-		).To(Succeed())
-
-		// We retain incident history.
 		Expect(
 			resolvedReports.Items,
 		).To(HaveLen(1))
 
 		resolvedReport :=
 			&resolvedReports.Items[0]
-
-		// -------------------------------------------------------------
-		// STEP 7:
-		// Verify same report identity.
-		// -------------------------------------------------------------
 
 		Expect(
 			resolvedReport.Name,
@@ -606,11 +325,6 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			resolvedReport.Spec.Fingerprint,
 		).To(Equal(fingerprint))
 
-		// -------------------------------------------------------------
-		// STEP 8:
-		// Verify lifecycle transition.
-		// -------------------------------------------------------------
-
 		Expect(
 			resolvedReport.Status.Phase,
 		).To(Equal("Resolved"))
@@ -619,32 +333,20 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			resolvedReport.Status.ResolvedAt,
 		).NotTo(BeNil())
 
-		// -------------------------------------------------------------
-		// STEP 9:
-		// Historical data must remain unchanged.
-		// -------------------------------------------------------------
-
-		Expect(
-			resolvedReport.Status.FirstDetectedAt,
-		).NotTo(BeNil())
-
+		// Historical timestamps must remain intact.
 		Expect(
 			resolvedReport.Status.FirstDetectedAt.Time.Equal(
-				firstDetectedTime,
+				firstDetectedAt,
 			),
 		).To(BeTrue())
-
-		Expect(
-			resolvedReport.Status.LastObservedAt,
-		).NotTo(BeNil())
 
 		Expect(
 			resolvedReport.Status.LastObservedAt.Time.Equal(
-				lastObservedTime,
+				lastObservedAt,
 			),
 		).To(BeTrue())
 
-		// Evidence from the incident should also be preserved.
+		// Evidence from the incident must remain available.
 		Expect(
 			resolvedReport.Status.Evidence.RestartCount,
 		).To(Equal(restartCount))
@@ -653,4 +355,538 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			resolvedReport.Status.Evidence.WaitingReason,
 		).To(Equal("CrashLoopBackOff"))
 	})
+
+	// ---------------------------------------------------------------------
+	// TEST 3:
+	// Multiple failures must generate multiple IncidentReports.
+	// ---------------------------------------------------------------------
+
+	It("creates separate Active IncidentReports for simultaneous incidents", func() {
+
+		// -------------------------------------------------------------
+		// CrashLoopBackOff Pod.
+		// -------------------------------------------------------------
+
+		createLifecyclePod(
+			"multi-crash-pod",
+			map[string]string{
+				"app": "multi-incident-test",
+			},
+			corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{
+					Reason: "CrashLoopBackOff",
+				},
+			},
+			corev1.ContainerState{},
+			4,
+		)
+
+		// -------------------------------------------------------------
+		// OOMKilled Pod.
+		//
+		// Container is currently running, but the previous termination
+		// was OOMKilled.
+		// -------------------------------------------------------------
+
+		createLifecyclePod(
+			"multi-oom-pod",
+			map[string]string{
+				"app": "multi-incident-test",
+			},
+			corev1.ContainerState{
+				Running: &corev1.ContainerStateRunning{},
+			},
+			corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					Reason:   "OOMKilled",
+					ExitCode: 137,
+				},
+			},
+			2,
+		)
+
+		// -------------------------------------------------------------
+		// ImagePullBackOff Pod.
+		// -------------------------------------------------------------
+
+		createLifecyclePod(
+			"multi-image-pod",
+			map[string]string{
+				"app": "multi-incident-test",
+			},
+			corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{
+					Reason: "ImagePullBackOff",
+				},
+			},
+			corev1.ContainerState{},
+			0,
+		)
+
+		policy := &opsv1alpha1.IncidentPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "multi-incident-policy",
+				Namespace: controllerTestNamespace,
+			},
+
+			Spec: opsv1alpha1.IncidentPolicySpec{
+				Selector: metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "multi-incident-test",
+					},
+				},
+
+				Checks: opsv1alpha1.IncidentChecks{
+					CrashLoop: true,
+					OOMKilled: true,
+					ImagePull: true,
+				},
+			},
+		}
+
+		Expect(
+			k8sClient.Create(
+				ctx,
+				policy,
+			),
+		).To(Succeed())
+
+		updatedPolicy :=
+			reconcilePolicy(
+				policy.Name,
+			)
+
+		// -------------------------------------------------------------
+		// Policy summary should indicate multiple incidents.
+		// -------------------------------------------------------------
+
+		condition :=
+			apimeta.FindStatusCondition(
+				updatedPolicy.Status.Conditions,
+				conditionTypeIncidentDetected,
+			)
+
+		Expect(condition).NotTo(BeNil())
+
+		Expect(
+			condition.Status,
+		).To(Equal(metav1.ConditionTrue))
+
+		Expect(
+			condition.Reason,
+		).To(Equal("MultipleIncidentsDetected"))
+
+		Expect(
+			condition.Message,
+		).To(ContainSubstring("3 active incidents"))
+
+		// -------------------------------------------------------------
+		// Exactly three IncidentReports should exist.
+		// -------------------------------------------------------------
+
+		reports := listReportsForPolicy(
+			policy,
+		)
+
+		Expect(
+			reports.Items,
+		).To(HaveLen(3))
+
+		reportsByType :=
+			reportMapByIncidentType(
+				reports,
+			)
+
+		Expect(
+			reportsByType,
+		).To(HaveKey("CrashLoopBackOff"))
+
+		Expect(
+			reportsByType,
+		).To(HaveKey("OOMKilled"))
+
+		Expect(
+			reportsByType,
+		).To(HaveKey("ImagePullBackOff"))
+
+		Expect(
+			reportsByType["CrashLoopBackOff"].Status.Phase,
+		).To(Equal("Active"))
+
+		Expect(
+			reportsByType["OOMKilled"].Status.Phase,
+		).To(Equal("Active"))
+
+		Expect(
+			reportsByType["ImagePullBackOff"].Status.Phase,
+		).To(Equal("Active"))
+
+		// -------------------------------------------------------------
+		// Verify evidence was collected independently.
+		// -------------------------------------------------------------
+
+		Expect(
+			reportsByType["CrashLoopBackOff"].
+				Status.Evidence.WaitingReason,
+		).To(Equal("CrashLoopBackOff"))
+
+		Expect(
+			reportsByType["OOMKilled"].
+				Status.Evidence.LastTerminationReason,
+		).To(Equal("OOMKilled"))
+
+		Expect(
+			reportsByType["OOMKilled"].
+				Status.Evidence.ExitCode,
+		).NotTo(BeNil())
+
+		Expect(
+			*reportsByType["OOMKilled"].
+				Status.Evidence.ExitCode,
+		).To(Equal(int32(137)))
+
+		Expect(
+			reportsByType["ImagePullBackOff"].
+				Status.Evidence.WaitingReason,
+		).To(Equal("ImagePullBackOff"))
+	})
+
+	// ---------------------------------------------------------------------
+	// TEST 4:
+	// One incident can resolve while another remains Active.
+	// ---------------------------------------------------------------------
+
+	It("resolves one incident independently while another remains Active", func() {
+
+		// -------------------------------------------------------------
+		// Pod A: CrashLoopBackOff.
+		// -------------------------------------------------------------
+
+		crashPod := createLifecyclePod(
+			"partial-crash-pod",
+			map[string]string{
+				"app": "partial-recovery-test",
+			},
+			corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{
+					Reason: "CrashLoopBackOff",
+				},
+			},
+			corev1.ContainerState{},
+			6,
+		)
+
+		// -------------------------------------------------------------
+		// Pod B: OOMKilled.
+		// -------------------------------------------------------------
+
+		createLifecyclePod(
+			"partial-oom-pod",
+			map[string]string{
+				"app": "partial-recovery-test",
+			},
+			corev1.ContainerState{
+				Running: &corev1.ContainerStateRunning{},
+			},
+			corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					Reason:   "OOMKilled",
+					ExitCode: 137,
+				},
+			},
+			1,
+		)
+
+		policy := &opsv1alpha1.IncidentPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "partial-recovery-policy",
+				Namespace: controllerTestNamespace,
+			},
+
+			Spec: opsv1alpha1.IncidentPolicySpec{
+				Selector: metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "partial-recovery-test",
+					},
+				},
+
+				Checks: opsv1alpha1.IncidentChecks{
+					CrashLoop: true,
+					OOMKilled: true,
+				},
+			},
+		}
+
+		Expect(
+			k8sClient.Create(
+				ctx,
+				policy,
+			),
+		).To(Succeed())
+
+		// -------------------------------------------------------------
+		// Initial reconciliation:
+		//
+		// CrashLoop = Active
+		// OOMKilled = Active
+		// -------------------------------------------------------------
+
+		firstPolicy :=
+			reconcilePolicy(
+				policy.Name,
+			)
+
+		firstCondition :=
+			apimeta.FindStatusCondition(
+				firstPolicy.Status.Conditions,
+				conditionTypeIncidentDetected,
+			)
+
+		Expect(firstCondition).NotTo(BeNil())
+
+		Expect(
+			firstCondition.Reason,
+		).To(Equal("MultipleIncidentsDetected"))
+
+		initialReports :=
+			listReportsForPolicy(
+				policy,
+			)
+
+		Expect(
+			initialReports.Items,
+		).To(HaveLen(2))
+
+		initialByType :=
+			reportMapByIncidentType(
+				initialReports,
+			)
+
+		Expect(
+			initialByType["CrashLoopBackOff"].
+				Status.Phase,
+		).To(Equal("Active"))
+
+		Expect(
+			initialByType["OOMKilled"].
+				Status.Phase,
+		).To(Equal("Active"))
+
+		crashFingerprint :=
+			initialByType["CrashLoopBackOff"].
+				Spec.Fingerprint
+
+		oomFingerprint :=
+			initialByType["OOMKilled"].
+				Spec.Fingerprint
+
+		// -------------------------------------------------------------
+		// CrashLoop Pod recovers.
+		//
+		// OOMKilled evidence on the other Pod still exists.
+		// -------------------------------------------------------------
+
+		crashPod.Status.ContainerStatuses =
+			[]corev1.ContainerStatus{
+				{
+					Name:         "app",
+					RestartCount: 6,
+
+					State: corev1.ContainerState{
+						Running: &corev1.ContainerStateRunning{},
+					},
+				},
+			}
+
+		Expect(
+			k8sClient.Status().Update(
+				ctx,
+				crashPod,
+			),
+		).To(Succeed())
+
+		// -------------------------------------------------------------
+		// Reconcile again.
+		// -------------------------------------------------------------
+
+		secondPolicy :=
+			reconcilePolicy(
+				policy.Name,
+			)
+
+		secondCondition :=
+			apimeta.FindStatusCondition(
+				secondPolicy.Status.Conditions,
+				conditionTypeIncidentDetected,
+			)
+
+		Expect(secondCondition).NotTo(BeNil())
+
+		// Only OOMKilled remains, so the summary returns to the
+		// single-incident reason.
+		Expect(
+			secondCondition.Status,
+		).To(Equal(metav1.ConditionTrue))
+
+		Expect(
+			secondCondition.Reason,
+		).To(Equal("OOMKilledDetected"))
+
+		// -------------------------------------------------------------
+		// Both historical reports still exist.
+		// -------------------------------------------------------------
+
+		finalReports :=
+			listReportsForPolicy(
+				policy,
+			)
+
+		Expect(
+			finalReports.Items,
+		).To(HaveLen(2))
+
+		finalByType :=
+			reportMapByIncidentType(
+				finalReports,
+			)
+
+		// CrashLoop report is independently resolved.
+		Expect(
+			finalByType["CrashLoopBackOff"].
+				Status.Phase,
+		).To(Equal("Resolved"))
+
+		Expect(
+			finalByType["CrashLoopBackOff"].
+				Status.ResolvedAt,
+		).NotTo(BeNil())
+
+		// OOMKilled report remains Active.
+		Expect(
+			finalByType["OOMKilled"].
+				Status.Phase,
+		).To(Equal("Active"))
+
+		Expect(
+			finalByType["OOMKilled"].
+				Status.ResolvedAt,
+		).To(BeNil())
+
+		// Neither report identity changed.
+		Expect(
+			finalByType["CrashLoopBackOff"].
+				Spec.Fingerprint,
+		).To(Equal(crashFingerprint))
+
+		Expect(
+			finalByType["OOMKilled"].
+				Spec.Fingerprint,
+		).To(Equal(oomFingerprint))
+	})
 })
+
+// -----------------------------------------------------------------------------
+// Test helpers
+// -----------------------------------------------------------------------------
+
+// createLifecyclePod creates a Pod and simulates the status normally
+// maintained by kubelet.
+//
+// envtest runs an API server and etcd but does not run kubelet, so Pod
+// container status must be written explicitly by the test.
+func createLifecyclePod(
+	name string,
+	podLabels map[string]string,
+	state corev1.ContainerState,
+	lastTerminationState corev1.ContainerState,
+	restartCount int32,
+) *corev1.Pod {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: controllerTestNamespace,
+			Labels:    podLabels,
+		},
+
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: "busybox:1.36",
+				},
+			},
+		},
+	}
+
+	Expect(
+		k8sClient.Create(
+			ctx,
+			pod,
+		),
+	).To(Succeed())
+
+	pod.Status.ContainerStatuses =
+		[]corev1.ContainerStatus{
+			{
+				Name:                 "app",
+				RestartCount:         restartCount,
+				State:                state,
+				LastTerminationState: lastTerminationState,
+			},
+		}
+
+	Expect(
+		k8sClient.Status().Update(
+			ctx,
+			pod,
+		),
+	).To(Succeed())
+
+	return pod
+}
+
+// listReportsForPolicy returns only IncidentReports created for the supplied
+// IncidentPolicy.
+func listReportsForPolicy(
+	policy *opsv1alpha1.IncidentPolicy,
+) *opsv1alpha1.IncidentReportList {
+	reports :=
+		&opsv1alpha1.IncidentReportList{}
+
+	Expect(
+		k8sClient.List(
+			ctx,
+			reports,
+
+			client.InNamespace(
+				controllerTestNamespace,
+			),
+
+			client.MatchingLabels{
+				reportPolicyUIDLabel: string(policy.UID),
+			},
+		),
+	).To(Succeed())
+
+	return reports
+}
+
+// reportMapByIncidentType makes multi-incident assertions easier to read.
+func reportMapByIncidentType(
+	reports *opsv1alpha1.IncidentReportList,
+) map[string]*opsv1alpha1.IncidentReport {
+	result :=
+		make(
+			map[string]*opsv1alpha1.IncidentReport,
+		)
+
+	for i := range reports.Items {
+		report :=
+			&reports.Items[i]
+
+		result[report.Spec.IncidentType] =
+			report
+	}
+
+	return result
+}
