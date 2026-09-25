@@ -24,7 +24,17 @@ rules:
   - ops.kubetriage.dev
   resources:
   - incidentpolicies/status
+  - incidentreports/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - ops.kubetriage.dev
+  resources:
+  - incidentreports
+  verbs:
+  - create
+  - get
+  - list
+  - watch

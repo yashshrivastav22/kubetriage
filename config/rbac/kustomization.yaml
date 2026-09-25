@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the kubetriage itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- incidentreport_admin_role.yaml
+- incidentreport_editor_role.yaml
+- incidentreport_viewer_role.yaml
 - incidentpolicy_admin_role.yaml
 - incidentpolicy_editor_role.yaml
 - incidentpolicy_viewer_role.yaml

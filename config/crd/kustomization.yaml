@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/ops.kubetriage.dev_incidentpolicies.yaml
+- bases/ops.kubetriage.dev_incidentreports.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
