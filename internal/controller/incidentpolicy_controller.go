@@ -32,7 +32,7 @@ const (
 	reportIncidentTypeLabel = "ops.kubetriage.dev/incident-type"
 )
 
-// incidentFinding represents a normalized incident detected from Pod status.
+// incidentFinding represents one normalized incident detected from Pod status.
 type incidentFinding struct {
 	PodName       string
 	PodUID        string
@@ -88,7 +88,7 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	policy.Status.ObservedGeneration = policy.Generation
 
 	// ---------------------------------------------------------------------
-	// STEP 2: Convert label selector.
+	// STEP 2: Convert the label selector.
 	// ---------------------------------------------------------------------
 
 	selector, err := metav1.LabelSelectorAsSelector(
@@ -132,7 +132,7 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 3: Find matching Pods.
+	// STEP 3: Find every Pod matching this IncidentPolicy.
 	// ---------------------------------------------------------------------
 
 	pods := &corev1.PodList{}
@@ -164,6 +164,11 @@ func (r *IncidentPolicyReconciler) Reconcile(
 
 	// ---------------------------------------------------------------------
 	// STEP 4: No matching Pods.
+	//
+	// We intentionally DO NOT resolve existing reports here.
+	//
+	// No matching Pods means the application state is unknown. It does not
+	// prove that an existing incident has recovered.
 	// ---------------------------------------------------------------------
 
 	if len(pods.Items) == 0 {
@@ -203,7 +208,7 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 5: Policy can be evaluated.
+	// STEP 5: The policy can be evaluated.
 	// ---------------------------------------------------------------------
 
 	apimeta.SetStatusCondition(
@@ -218,55 +223,133 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	)
 
 	// ---------------------------------------------------------------------
-	// STEP 6: Run detectors.
+	// STEP 6:
+	// Run ALL enabled detectors.
 	//
-	// Current priority:
+	// Previously KubeTriage returned only one *incidentFinding.
 	//
-	// 1. CrashLoopBackOff
-	// 2. OOMKilled
-	// 3. Image pull failure
-	//
-	// For now only the first detected finding is returned.
+	// Now every detector can return multiple findings.
 	// ---------------------------------------------------------------------
 
-	var finding *incidentFinding
+	findings := make(
+		[]incidentFinding,
+		0,
+	)
 
 	if policy.Spec.Checks.CrashLoop {
-		finding = findCrashLoopBackOff(
-			pods.Items,
+		findings = append(
+			findings,
+			findCrashLoopBackOff(
+				pods.Items,
+			)...,
 		)
 	}
 
-	if finding == nil &&
-		policy.Spec.Checks.OOMKilled {
-		finding = findOOMKilled(
-			pods.Items,
+	if policy.Spec.Checks.OOMKilled {
+		findings = append(
+			findings,
+			findOOMKilled(
+				pods.Items,
+			)...,
 		)
 	}
 
-	if finding == nil &&
-		policy.Spec.Checks.ImagePull {
-		finding = findImagePullFailure(
-			pods.Items,
+	if policy.Spec.Checks.ImagePull {
+		findings = append(
+			findings,
+			findImagePullFailures(
+				pods.Items,
+			)...,
 		)
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 7: Manage IncidentReport lifecycle.
+	// STEP 7:
+	// Create/update every currently observed incident.
+	//
+	// observedFingerprints represents the incident state of the cluster
+	// during THIS reconciliation.
 	// ---------------------------------------------------------------------
 
-	if finding != nil {
-		// An incident currently exists.
+	observedFingerprints :=
+		make(map[string]struct{})
+
+	activeFindings :=
+		make([]incidentFinding, 0)
+
+	for i := range findings {
+		finding := &findings[i]
+
+		fingerprint := buildIncidentFingerprint(
+			policy,
+			finding,
+		)
+
+		// Defensive de-duplication.
 		//
-		// Create a report if this is the first observation.
-		// Otherwise update the existing report.
+		// If two detector paths somehow produce the exact same incident,
+		// process it only once during this reconciliation.
+		if _, alreadyObserved :=
+			observedFingerprints[fingerprint]; alreadyObserved {
+			continue
+		}
+
 		if err := r.ensureIncidentReport(
 			ctx,
 			policy,
 			finding,
+			fingerprint,
 		); err != nil {
 			return ctrl.Result{}, err
 		}
+
+		observedFingerprints[fingerprint] =
+			struct{}{}
+
+		activeFindings = append(
+			activeFindings,
+			*finding,
+		)
+	}
+
+	// ---------------------------------------------------------------------
+	// STEP 8:
+	// Resolve only reports that were NOT observed during this reconciliation.
+	//
+	// This is what allows independent incident lifecycle management.
+	// ---------------------------------------------------------------------
+
+	if err := r.resolveUnobservedIncidentReports(
+		ctx,
+		policy,
+		observedFingerprints,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// ---------------------------------------------------------------------
+	// STEP 9:
+	// Publish summary state on IncidentPolicy.
+	//
+	// IncidentPolicy is the summary.
+	// IncidentReport objects hold the detailed per-incident state.
+	// ---------------------------------------------------------------------
+
+	switch len(activeFindings) {
+	case 0:
+		apimeta.SetStatusCondition(
+			&policy.Status.Conditions,
+			metav1.Condition{
+				Type:               conditionTypeIncidentDetected,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: policy.Generation,
+				Reason:             "NoIncidentDetected",
+				Message:            "No configured incident condition was detected.",
+			},
+		)
+
+	case 1:
+		finding := activeFindings[0]
 
 		apimeta.SetStatusCondition(
 			&policy.Status.Conditions,
@@ -278,32 +361,25 @@ func (r *IncidentPolicyReconciler) Reconcile(
 				Message:            finding.Message,
 			},
 		)
-	} else {
-		// No configured incident currently exists.
-		//
-		// Any previously Active reports for this policy can now be
-		// transitioned to Resolved.
-		if err := r.resolveActiveIncidentReports(
-			ctx,
-			policy,
-		); err != nil {
-			return ctrl.Result{}, err
-		}
 
+	default:
 		apimeta.SetStatusCondition(
 			&policy.Status.Conditions,
 			metav1.Condition{
 				Type:               conditionTypeIncidentDetected,
-				Status:             metav1.ConditionFalse,
+				Status:             metav1.ConditionTrue,
 				ObservedGeneration: policy.Generation,
-				Reason:             "NoIncidentDetected",
-				Message:            "No configured incident condition was detected.",
+				Reason:             "MultipleIncidentsDetected",
+				Message: fmt.Sprintf(
+					"%d active incidents were detected across matching Pods.",
+					len(activeFindings),
+				),
 			},
 		)
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 8: Persist IncidentPolicy status.
+	// STEP 10: Persist IncidentPolicy status.
 	// ---------------------------------------------------------------------
 
 	if err := r.updatePolicyStatusIfChanged(
@@ -315,7 +391,7 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 9: Periodic fallback reconciliation.
+	// STEP 11: Periodic reconciliation fallback.
 	// ---------------------------------------------------------------------
 
 	return ctrl.Result{
@@ -327,9 +403,16 @@ func (r *IncidentPolicyReconciler) Reconcile(
 // CrashLoopBackOff detector
 // -----------------------------------------------------------------------------
 
+// findCrashLoopBackOff returns every CrashLoopBackOff currently visible in
+// the selected Pods.
 func findCrashLoopBackOff(
 	pods []corev1.Pod,
-) *incidentFinding {
+) []incidentFinding {
+	findings := make(
+		[]incidentFinding,
+		0,
+	)
+
 	for i := range pods {
 		pod := &pods[i]
 
@@ -348,36 +431,47 @@ func findCrashLoopBackOff(
 					continue
 				}
 
-				return &incidentFinding{
-					PodName:       pod.Name,
-					PodUID:        string(pod.UID),
-					ContainerName: containerStatus.Name,
-					IncidentType:  "CrashLoopBackOff",
+				findings = append(
+					findings,
+					incidentFinding{
+						PodName:       pod.Name,
+						PodUID:        string(pod.UID),
+						ContainerName: containerStatus.Name,
+						IncidentType:  "CrashLoopBackOff",
 
-					Message: fmt.Sprintf(
-						"Pod %s container %s is in CrashLoopBackOff.",
-						pod.Name,
-						containerStatus.Name,
-					),
+						Message: fmt.Sprintf(
+							"Pod %s container %s is in CrashLoopBackOff.",
+							pod.Name,
+							containerStatus.Name,
+						),
 
-					RestartCount:  containerStatus.RestartCount,
-					CurrentState:  "Waiting",
-					WaitingReason: waiting.Reason,
-				}
+						RestartCount: containerStatus.RestartCount,
+
+						CurrentState: "Waiting",
+
+						WaitingReason: waiting.Reason,
+					},
+				)
 			}
 		}
 	}
 
-	return nil
+	return findings
 }
 
 // -----------------------------------------------------------------------------
 // OOMKilled detector
 // -----------------------------------------------------------------------------
 
+// findOOMKilled returns every currently observable OOMKilled incident.
 func findOOMKilled(
 	pods []corev1.Pod,
-) *incidentFinding {
+) []incidentFinding {
+	findings := make(
+		[]incidentFinding,
+		0,
+	)
+
 	for i := range pods {
 		pod := &pods[i]
 
@@ -393,11 +487,19 @@ func findOOMKilled(
 
 				if currentTermination != nil &&
 					currentTermination.Reason == "OOMKilled" {
-					return newOOMKilledFinding(
-						pod,
-						containerStatus,
-						currentTermination,
+					findings = append(
+						findings,
+						newOOMKilledFinding(
+							pod,
+							containerStatus,
+							currentTermination,
+						),
 					)
+
+					// Avoid creating the same OOM finding twice if both
+					// current and previous termination states happen to
+					// contain OOMKilled.
+					continue
 				}
 
 				lastTermination :=
@@ -405,27 +507,30 @@ func findOOMKilled(
 
 				if lastTermination != nil &&
 					lastTermination.Reason == "OOMKilled" {
-					return newOOMKilledFinding(
-						pod,
-						containerStatus,
-						lastTermination,
+					findings = append(
+						findings,
+						newOOMKilledFinding(
+							pod,
+							containerStatus,
+							lastTermination,
+						),
 					)
 				}
 			}
 		}
 	}
 
-	return nil
+	return findings
 }
 
 func newOOMKilledFinding(
 	pod *corev1.Pod,
 	containerStatus corev1.ContainerStatus,
 	termination *corev1.ContainerStateTerminated,
-) *incidentFinding {
+) incidentFinding {
 	exitCode := termination.ExitCode
 
-	return &incidentFinding{
+	return incidentFinding{
 		PodName:       pod.Name,
 		PodUID:        string(pod.UID),
 		ContainerName: containerStatus.Name,
@@ -444,7 +549,8 @@ func newOOMKilledFinding(
 		),
 
 		LastTerminationReason: "OOMKilled",
-		ExitCode:              &exitCode,
+
+		ExitCode: &exitCode,
 	}
 }
 
@@ -452,9 +558,16 @@ func newOOMKilledFinding(
 // Image pull detector
 // -----------------------------------------------------------------------------
 
-func findImagePullFailure(
+// findImagePullFailures returns every ErrImagePull or ImagePullBackOff
+// currently visible in the selected Pods.
+func findImagePullFailures(
 	pods []corev1.Pod,
-) *incidentFinding {
+) []incidentFinding {
+	findings := make(
+		[]incidentFinding,
+		0,
+	)
+
 	for i := range pods {
 		pod := &pods[i]
 
@@ -476,29 +589,37 @@ func findImagePullFailure(
 				case "ErrImagePull",
 					"ImagePullBackOff":
 
-					return &incidentFinding{
-						PodName:       pod.Name,
-						PodUID:        string(pod.UID),
-						ContainerName: containerStatus.Name,
-						IncidentType:  waiting.Reason,
+					findings = append(
+						findings,
+						incidentFinding{
+							PodName: pod.Name,
 
-						Message: fmt.Sprintf(
-							"Pod %s container %s cannot pull its image: %s.",
-							pod.Name,
-							containerStatus.Name,
-							waiting.Reason,
-						),
+							PodUID: string(pod.UID),
 
-						RestartCount:  containerStatus.RestartCount,
-						CurrentState:  "Waiting",
-						WaitingReason: waiting.Reason,
-					}
+							ContainerName: containerStatus.Name,
+
+							IncidentType: waiting.Reason,
+
+							Message: fmt.Sprintf(
+								"Pod %s container %s cannot pull its image: %s.",
+								pod.Name,
+								containerStatus.Name,
+								waiting.Reason,
+							),
+
+							RestartCount: containerStatus.RestartCount,
+
+							CurrentState: "Waiting",
+
+							WaitingReason: waiting.Reason,
+						},
+					)
 				}
 			}
 		}
 	}
 
-	return nil
+	return findings
 }
 
 // -----------------------------------------------------------------------------
@@ -509,12 +630,8 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 	ctx context.Context,
 	policy *opsv1alpha1.IncidentPolicy,
 	finding *incidentFinding,
+	fingerprint string,
 ) error {
-	fingerprint := buildIncidentFingerprint(
-		policy,
-		finding,
-	)
-
 	reportName := incidentReportName(
 		fingerprint,
 	)
@@ -524,7 +641,8 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 		Namespace: policy.Namespace,
 	}
 
-	report := &opsv1alpha1.IncidentReport{}
+	report :=
+		&opsv1alpha1.IncidentReport{}
 
 	err := r.Get(
 		ctx,
@@ -533,28 +651,36 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 	)
 
 	if apierrors.IsNotFound(err) {
-		report = &opsv1alpha1.IncidentReport{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      reportName,
-				Namespace: policy.Namespace,
+		report =
+			&opsv1alpha1.IncidentReport{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: reportName,
 
-				Labels: map[string]string{
-					reportPolicyUIDLabel: string(policy.UID),
+					Namespace: policy.Namespace,
 
-					reportIncidentTypeLabel: finding.IncidentType,
+					Labels: map[string]string{
+						reportPolicyUIDLabel: string(policy.UID),
+
+						reportIncidentTypeLabel: finding.IncidentType,
+					},
 				},
-			},
 
-			Spec: opsv1alpha1.IncidentReportSpec{
-				PolicyName:    policy.Name,
-				PolicyUID:     string(policy.UID),
-				PodName:       finding.PodName,
-				PodUID:        finding.PodUID,
-				ContainerName: finding.ContainerName,
-				IncidentType:  finding.IncidentType,
-				Fingerprint:   fingerprint,
-			},
-		}
+				Spec: opsv1alpha1.IncidentReportSpec{
+					PolicyName: policy.Name,
+
+					PolicyUID: string(policy.UID),
+
+					PodName: finding.PodName,
+
+					PodUID: finding.PodUID,
+
+					ContainerName: finding.ContainerName,
+
+					IncidentType: finding.IncidentType,
+
+					Fingerprint: fingerprint,
+				},
+			}
 
 		if err := r.Create(
 			ctx,
@@ -566,10 +692,7 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 		return err
 	}
 
-	// Defensive collision check.
-	//
-	// If the deterministic Kubernetes name somehow points to a report
-	// containing another fingerprint, do not silently reuse it.
+	// Defensive fingerprint collision check.
 	if report.Spec.Fingerprint != fingerprint {
 		return fmt.Errorf(
 			"incident report name collision: report %s has unexpected fingerprint",
@@ -585,7 +708,7 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 }
 
 // -----------------------------------------------------------------------------
-// IncidentReport Active status
+// IncidentReport Active state
 // -----------------------------------------------------------------------------
 
 func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
@@ -593,35 +716,40 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	report *opsv1alpha1.IncidentReport,
 	finding *incidentFinding,
 ) error {
-	before := report.DeepCopy()
+	before :=
+		report.DeepCopy()
 
 	now := metav1.Now()
 
-	// FirstDetectedAt is immutable for one incident lifecycle.
 	if report.Status.FirstDetectedAt == nil {
 		firstDetected := now
-		report.Status.FirstDetectedAt = &firstDetected
+
+		report.Status.FirstDetectedAt =
+			&firstDetected
 	}
 
-	// LastObservedAt is refreshed every time we continue observing
-	// the incident.
 	lastObserved := now
-	report.Status.LastObservedAt = &lastObserved
 
-	// If this exact incident is seen again, it is Active.
-	//
-	// ResolvedAt is cleared so this also supports re-observation of the
-	// same deterministic incident identity.
-	report.Status.Phase = "Active"
-	report.Status.ResolvedAt = nil
+	report.Status.LastObservedAt =
+		&lastObserved
+
+	report.Status.Phase =
+		"Active"
+
+	report.Status.ResolvedAt =
+		nil
 
 	report.Status.Evidence =
 		opsv1alpha1.IncidentEvidence{
-			RestartCount:          finding.RestartCount,
-			CurrentState:          finding.CurrentState,
-			WaitingReason:         finding.WaitingReason,
+			RestartCount: finding.RestartCount,
+
+			CurrentState: finding.CurrentState,
+
+			WaitingReason: finding.WaitingReason,
+
 			LastTerminationReason: finding.LastTerminationReason,
-			ExitCode:              finding.ExitCode,
+
+			ExitCode: finding.ExitCode,
 		}
 
 	if reflect.DeepEqual(
@@ -639,26 +767,30 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 }
 
 // -----------------------------------------------------------------------------
-// IncidentReport resolution
+// Independent IncidentReport resolution
 // -----------------------------------------------------------------------------
 
-// resolveActiveIncidentReports marks all currently Active reports belonging
-// to this IncidentPolicy as Resolved.
+// resolveUnobservedIncidentReports compares existing Active IncidentReports
+// against the fingerprints that were actually observed during the current
+// reconciliation.
 //
-// We keep the IncidentReport instead of deleting it because the report is
-// historical incident evidence.
-func (r *IncidentPolicyReconciler) resolveActiveIncidentReports(
+// Observed report:
+//     remains Active.
+//
+// Active report that was NOT observed:
+//     becomes Resolved.
+
+func (r *IncidentPolicyReconciler) resolveUnobservedIncidentReports(
 	ctx context.Context,
 	policy *opsv1alpha1.IncidentPolicy,
+	observedFingerprints map[string]struct{},
 ) error {
 	reports := &opsv1alpha1.IncidentReportList{}
 
 	if err := r.List(
 		ctx,
 		reports,
-		client.InNamespace(
-			policy.Namespace,
-		),
+		client.InNamespace(policy.Namespace),
 		client.MatchingLabels{
 			reportPolicyUIDLabel: string(policy.UID),
 		},
@@ -671,11 +803,19 @@ func (r *IncidentPolicyReconciler) resolveActiveIncidentReports(
 	for i := range reports.Items {
 		report := &reports.Items[i]
 
-		// Resolved reports require no additional writes.
+		// Only Active reports need lifecycle evaluation.
 		if report.Status.Phase != "Active" {
 			continue
 		}
 
+		// If this fingerprint was observed during the current
+		// reconciliation, the incident still exists.
+		if _, observed := observedFingerprints[report.Spec.Fingerprint]; observed {
+			continue
+		}
+
+		// This report was Active previously but was not observed
+		// during this reconciliation, so the incident has resolved.
 		before := report.DeepCopy()
 
 		report.Status.Phase = "Resolved"
@@ -683,13 +823,11 @@ func (r *IncidentPolicyReconciler) resolveActiveIncidentReports(
 		resolvedAt := now
 		report.Status.ResolvedAt = &resolvedAt
 
-		// Do not change:
+		// Preserve historical information:
 		//
 		// FirstDetectedAt
 		// LastObservedAt
 		// Evidence
-		//
-		// They describe what happened while the incident was active.
 
 		if reflect.DeepEqual(
 			before.Status,
@@ -714,18 +852,6 @@ func (r *IncidentPolicyReconciler) resolveActiveIncidentReports(
 // Incident fingerprint
 // -----------------------------------------------------------------------------
 
-// buildIncidentFingerprint creates deterministic incident identity from:
-//
-// Policy UID
-// +
-// Pod UID
-// +
-// Container
-// +
-// Incident type
-//
-// Therefore repeated reconciliation of the same incident generates the same
-// fingerprint.
 func buildIncidentFingerprint(
 	policy *opsv1alpha1.IncidentPolicy,
 	finding *incidentFinding,
@@ -738,9 +864,10 @@ func buildIncidentFingerprint(
 		finding.IncidentType,
 	)
 
-	hash := sha256.Sum256(
-		[]byte(raw),
-	)
+	hash :=
+		sha256.Sum256(
+			[]byte(raw),
+		)
 
 	return fmt.Sprintf(
 		"%x",
@@ -748,8 +875,8 @@ func buildIncidentFingerprint(
 	)
 }
 
-// incidentReportName converts the SHA-256 fingerprint into a short,
-// deterministic Kubernetes object name.
+// incidentReportName converts the fingerprint into a short deterministic
+// Kubernetes resource name.
 func incidentReportName(
 	fingerprint string,
 ) string {
@@ -758,7 +885,8 @@ func incidentReportName(
 	short := fingerprint
 
 	if len(short) > fingerprintLength {
-		short = short[:fingerprintLength]
+		short =
+			short[:fingerprintLength]
 	}
 
 	return "incident-" + short
@@ -787,7 +915,7 @@ func containerStateName(
 }
 
 // -----------------------------------------------------------------------------
-// IncidentPolicy status update helper
+// IncidentPolicy status helper
 // -----------------------------------------------------------------------------
 
 func (r *IncidentPolicyReconciler) updatePolicyStatusIfChanged(
@@ -813,15 +941,15 @@ func (r *IncidentPolicyReconciler) updatePolicyStatusIfChanged(
 // Pod event mapping
 // -----------------------------------------------------------------------------
 
-// mapPodToIncidentPolicies maps a Pod event to every IncidentPolicy in the
-// same namespace whose selector matches the Pod.
 func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	ctx context.Context,
 	obj client.Object,
 ) []reconcile.Request {
-	log := logf.FromContext(ctx)
+	log :=
+		logf.FromContext(ctx)
 
-	pod, ok := obj.(*corev1.Pod)
+	pod, ok :=
+		obj.(*corev1.Pod)
 
 	if !ok {
 		return nil
@@ -853,7 +981,8 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 		make([]reconcile.Request, 0)
 
 	for i := range policies.Items {
-		policy := &policies.Items[i]
+		policy :=
+			&policies.Items[i]
 
 		selector, err :=
 			metav1.LabelSelectorAsSelector(
