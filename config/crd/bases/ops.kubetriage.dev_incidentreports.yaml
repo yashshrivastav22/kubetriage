@@ -58,10 +58,15 @@ spec:
                 type: string
               fingerprint:
                 description: |-
-                  Fingerprint is the stable identity used by KubeTriage to avoid creating
+                  Fingerprint is the stable identity used by KubeTriage to avoid
                   duplicate reports for the same incident.
 
-                  It will be derived from the policy, Pod, container, and incident type.
+                  It is derived from:
+
+                  Policy UID
+                  Pod UID
+                  Container name
+                  Incident type
                 minLength: 1
                 type: string
               incidentType:
@@ -164,14 +169,82 @@ spec:
                 x-kubernetes-list-type: map
               evidence:
                 description: |-
-                  Evidence contains bounded Kubernetes evidence associated with
-                  the most recent observation.
+                  Evidence contains bounded Kubernetes evidence associated with the
+                  most recent observation.
                 properties:
                   currentState:
                     description: |-
                       CurrentState describes the current container state when the incident
                       was last evaluated.
                     type: string
+                  events:
+                    description: |-
+                      Events contains a bounded set of Kubernetes Events related to the
+                      affected Pod.
+
+                      KubeTriage intentionally limits this collection so IncidentReport
+                      objects cannot grow without bound.
+                    items:
+                      description: |-
+                        IncidentEventEvidence represents bounded Kubernetes Event evidence collected
+                        for the Pod involved in an incident.
+
+                        Events are supplemental evidence. They should not be treated as the sole
+                        source of truth because Kubernetes Events have limited retention.
+                      properties:
+                        action:
+                          description: Action describes the action reported by the
+                            Event producer.
+                          type: string
+                        count:
+                          description: |-
+                            Count represents how many times this Event occurred when Kubernetes
+                            reports it as an Event series.
+                            Singleton Events are represented with count 1.
+                          format: int32
+                          type: integer
+                        firstObservedAt:
+                          description: FirstObservedAt represents when the Event was
+                            first observed.
+                          format: date-time
+                          type: string
+                        lastObservedAt:
+                          description: |-
+                            LastObservedAt represents the most recent observation of an Event
+                            series when available.
+                          format: date-time
+                          type: string
+                        note:
+                          description: |-
+                            Note contains the human-readable Event description.
+
+                            KubeTriage bounds this field before storing it.
+                          maxLength: 1024
+                          type: string
+                        reason:
+                          description: |-
+                            Reason is the machine-readable Kubernetes Event reason.
+
+                            Examples:
+                            BackOff
+                            Failed
+                            Pulling
+                            FailedScheduling
+                          type: string
+                        reportingController:
+                          description: |-
+                            ReportingController identifies the component that reported the Event.
+
+                            Example:
+                            kubernetes.io/kubelet
+                          type: string
+                        type:
+                          description: Type is normally Normal or Warning.
+                          type: string
+                      type: object
+                    maxItems: 10
+                    type: array
+                    x-kubernetes-list-type: atomic
                   exitCode:
                     description: ExitCode contains the previous container exit code
                       when available.
@@ -179,9 +252,11 @@ spec:
                     type: integer
                   lastTerminationReason:
                     description: |-
-                      LastTerminationReason contains the previous container termination reason
-                      when available.
-                      Example: OOMKilled.
+                      LastTerminationReason contains the previous container termination
+                      reason when available.
+
+                      Example:
+                      OOMKilled
                     type: string
                   restartCount:
                     description: RestartCount is the restart count reported for the
@@ -191,7 +266,11 @@ spec:
                   waitingReason:
                     description: |-
                       WaitingReason contains the Kubernetes waiting reason when applicable.
-                      Examples include CrashLoopBackOff and ImagePullBackOff.
+
+                      Examples:
+                      CrashLoopBackOff
+                      ErrImagePull
+                      ImagePullBackOff
                     type: string
                 type: object
               firstDetectedAt:

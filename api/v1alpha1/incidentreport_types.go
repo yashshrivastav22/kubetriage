@@ -21,6 +21,60 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// IncidentEventEvidence represents bounded Kubernetes Event evidence collected
+// for the Pod involved in an incident.
+//
+// Events are supplemental evidence. They should not be treated as the sole
+// source of truth because Kubernetes Events have limited retention.
+type IncidentEventEvidence struct {
+	// Type is normally Normal or Warning.
+	// +optional
+	Type string `json:"type,omitempty"`
+
+	// Reason is the machine-readable Kubernetes Event reason.
+	//
+	// Examples:
+	// BackOff
+	// Failed
+	// Pulling
+	// FailedScheduling
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Action describes the action reported by the Event producer.
+	// +optional
+	Action string `json:"action,omitempty"`
+
+	// Note contains the human-readable Event description.
+	//
+	// KubeTriage bounds this field before storing it.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Note string `json:"note,omitempty"`
+
+	// Count represents how many times this Event occurred when Kubernetes
+	// reports it as an Event series.
+	// Singleton Events are represented with count 1.
+	// +optional
+	Count int32 `json:"count,omitempty"`
+
+	// FirstObservedAt represents when the Event was first observed.
+	// +optional
+	FirstObservedAt *metav1.Time `json:"firstObservedAt,omitempty"`
+
+	// LastObservedAt represents the most recent observation of an Event
+	// series when available.
+	// +optional
+	LastObservedAt *metav1.Time `json:"lastObservedAt,omitempty"`
+
+	// ReportingController identifies the component that reported the Event.
+	//
+	// Example:
+	// kubernetes.io/kubelet
+	// +optional
+	ReportingController string `json:"reportingController,omitempty"`
+}
+
 // IncidentEvidence contains bounded Kubernetes evidence associated with
 // an incident.
 type IncidentEvidence struct {
@@ -34,19 +88,36 @@ type IncidentEvidence struct {
 	CurrentState string `json:"currentState,omitempty"`
 
 	// WaitingReason contains the Kubernetes waiting reason when applicable.
-	// Examples include CrashLoopBackOff and ImagePullBackOff.
+	//
+	// Examples:
+	// CrashLoopBackOff
+	// ErrImagePull
+	// ImagePullBackOff
 	// +optional
 	WaitingReason string `json:"waitingReason,omitempty"`
 
-	// LastTerminationReason contains the previous container termination reason
-	// when available.
-	// Example: OOMKilled.
+	// LastTerminationReason contains the previous container termination
+	// reason when available.
+	//
+	// Example:
+	// OOMKilled
 	// +optional
 	LastTerminationReason string `json:"lastTerminationReason,omitempty"`
 
 	// ExitCode contains the previous container exit code when available.
 	// +optional
 	ExitCode *int32 `json:"exitCode,omitempty"`
+
+	// Events contains a bounded set of Kubernetes Events related to the
+	// affected Pod.
+	//
+	// KubeTriage intentionally limits this collection so IncidentReport
+	// objects cannot grow without bound.
+	//
+	// +kubebuilder:validation:MaxItems=10
+	// +listType=atomic
+	// +optional
+	Events []IncidentEventEvidence `json:"events,omitempty"`
 }
 
 // IncidentReportSpec defines the stable identity of a detected incident.
@@ -82,10 +153,15 @@ type IncidentReportSpec struct {
 	// +required
 	IncidentType string `json:"incidentType"`
 
-	// Fingerprint is the stable identity used by KubeTriage to avoid creating
+	// Fingerprint is the stable identity used by KubeTriage to avoid
 	// duplicate reports for the same incident.
 	//
-	// It will be derived from the policy, Pod, container, and incident type.
+	// It is derived from:
+	//
+	// Policy UID
+	// Pod UID
+	// Container name
+	// Incident type
 	//
 	// +kubebuilder:validation:MinLength=1
 	// +required
@@ -113,8 +189,8 @@ type IncidentReportStatus struct {
 	// +optional
 	ResolvedAt *metav1.Time `json:"resolvedAt,omitempty"`
 
-	// Evidence contains bounded Kubernetes evidence associated with
-	// the most recent observation.
+	// Evidence contains bounded Kubernetes evidence associated with the
+	// most recent observation.
 	// +optional
 	Evidence IncidentEvidence `json:"evidence,omitempty"`
 
@@ -153,7 +229,8 @@ type IncidentReport struct {
 type IncidentReportList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
-	Items           []IncidentReport `json:"items"`
+
+	Items []IncidentReport `json:"items"`
 }
 
 func init() {

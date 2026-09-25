@@ -62,6 +62,7 @@ type IncidentPolicyReconciler struct {
 // +kubebuilder:rbac:groups=ops.kubetriage.dev,resources=incidentreports,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=ops.kubetriage.dev,resources=incidentreports/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=get;list;watch
 
 func (r *IncidentPolicyReconciler) Reconcile(
 	ctx context.Context,
@@ -716,6 +717,8 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	report *opsv1alpha1.IncidentReport,
 	finding *incidentFinding,
 ) error {
+	log := logf.FromContext(ctx)
+
 	before :=
 		report.DeepCopy()
 
@@ -739,6 +742,36 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	report.Status.ResolvedAt =
 		nil
 
+	// -----------------------------------------------------------------
+	// Collect Kubernetes Event evidence.
+	//
+	// Events are supplemental evidence, so an Event API failure should
+	// not prevent the primary incident from being recorded.
+	// -----------------------------------------------------------------
+
+	eventEvidence, eventErr :=
+		r.collectPodEventEvidence(
+			ctx,
+			report.Namespace,
+			finding.PodUID,
+		)
+
+	if eventErr != nil {
+		log.Error(
+			eventErr,
+			"failed to collect Kubernetes Event evidence",
+			"incidentReport",
+			report.Name,
+			"pod",
+			finding.PodName,
+		)
+
+		// Preserve previously collected Event evidence if this particular
+		// Event lookup fails.
+		eventEvidence =
+			before.Status.Evidence.Events
+	}
+
 	report.Status.Evidence =
 		opsv1alpha1.IncidentEvidence{
 			RestartCount: finding.RestartCount,
@@ -750,6 +783,8 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 			LastTerminationReason: finding.LastTerminationReason,
 
 			ExitCode: finding.ExitCode,
+
+			Events: eventEvidence,
 		}
 
 	if reflect.DeepEqual(
