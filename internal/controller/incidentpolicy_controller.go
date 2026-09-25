@@ -219,6 +219,14 @@ func (r *IncidentPolicyReconciler) Reconcile(
 
 	// ---------------------------------------------------------------------
 	// STEP 6: Run detectors.
+	//
+	// Current priority:
+	//
+	// 1. CrashLoopBackOff
+	// 2. OOMKilled
+	// 3. Image pull failure
+	//
+	// For now only the first detected finding is returned.
 	// ---------------------------------------------------------------------
 
 	var finding *incidentFinding
@@ -244,10 +252,14 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 7: If an incident exists, create or update its IncidentReport.
+	// STEP 7: Manage IncidentReport lifecycle.
 	// ---------------------------------------------------------------------
 
 	if finding != nil {
+		// An incident currently exists.
+		//
+		// Create a report if this is the first observation.
+		// Otherwise update the existing report.
 		if err := r.ensureIncidentReport(
 			ctx,
 			policy,
@@ -267,6 +279,17 @@ func (r *IncidentPolicyReconciler) Reconcile(
 			},
 		)
 	} else {
+		// No configured incident currently exists.
+		//
+		// Any previously Active reports for this policy can now be
+		// transitioned to Resolved.
+		if err := r.resolveActiveIncidentReports(
+			ctx,
+			policy,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		apimeta.SetStatusCondition(
 			&policy.Status.Conditions,
 			metav1.Condition{
@@ -479,7 +502,7 @@ func findImagePullFailure(
 }
 
 // -----------------------------------------------------------------------------
-// IncidentReport lifecycle
+// IncidentReport create/update lifecycle
 // -----------------------------------------------------------------------------
 
 func (r *IncidentPolicyReconciler) ensureIncidentReport(
@@ -544,6 +567,9 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 	}
 
 	// Defensive collision check.
+	//
+	// If the deterministic Kubernetes name somehow points to a report
+	// containing another fingerprint, do not silently reuse it.
 	if report.Spec.Fingerprint != fingerprint {
 		return fmt.Errorf(
 			"incident report name collision: report %s has unexpected fingerprint",
@@ -558,6 +584,10 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 	)
 }
 
+// -----------------------------------------------------------------------------
+// IncidentReport Active status
+// -----------------------------------------------------------------------------
+
 func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	ctx context.Context,
 	report *opsv1alpha1.IncidentReport,
@@ -567,14 +597,21 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 
 	now := metav1.Now()
 
+	// FirstDetectedAt is immutable for one incident lifecycle.
 	if report.Status.FirstDetectedAt == nil {
 		firstDetected := now
 		report.Status.FirstDetectedAt = &firstDetected
 	}
 
+	// LastObservedAt is refreshed every time we continue observing
+	// the incident.
 	lastObserved := now
 	report.Status.LastObservedAt = &lastObserved
 
+	// If this exact incident is seen again, it is Active.
+	//
+	// ResolvedAt is cleared so this also supports re-observation of the
+	// same deterministic incident identity.
 	report.Status.Phase = "Active"
 	report.Status.ResolvedAt = nil
 
@@ -601,11 +638,93 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	)
 }
 
-// buildIncidentFingerprint creates a deterministic identity from:
+// -----------------------------------------------------------------------------
+// IncidentReport resolution
+// -----------------------------------------------------------------------------
+
+// resolveActiveIncidentReports marks all currently Active reports belonging
+// to this IncidentPolicy as Resolved.
 //
-// Policy UID + Pod UID + Container + Incident Type.
+// We keep the IncidentReport instead of deleting it because the report is
+// historical incident evidence.
+func (r *IncidentPolicyReconciler) resolveActiveIncidentReports(
+	ctx context.Context,
+	policy *opsv1alpha1.IncidentPolicy,
+) error {
+	reports := &opsv1alpha1.IncidentReportList{}
+
+	if err := r.List(
+		ctx,
+		reports,
+		client.InNamespace(
+			policy.Namespace,
+		),
+		client.MatchingLabels{
+			reportPolicyUIDLabel: string(policy.UID),
+		},
+	); err != nil {
+		return err
+	}
+
+	now := metav1.Now()
+
+	for i := range reports.Items {
+		report := &reports.Items[i]
+
+		// Resolved reports require no additional writes.
+		if report.Status.Phase != "Active" {
+			continue
+		}
+
+		before := report.DeepCopy()
+
+		report.Status.Phase = "Resolved"
+
+		resolvedAt := now
+		report.Status.ResolvedAt = &resolvedAt
+
+		// Do not change:
+		//
+		// FirstDetectedAt
+		// LastObservedAt
+		// Evidence
+		//
+		// They describe what happened while the incident was active.
+
+		if reflect.DeepEqual(
+			before.Status,
+			report.Status,
+		) {
+			continue
+		}
+
+		if err := r.Status().Patch(
+			ctx,
+			report,
+			client.MergeFrom(before),
+		); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Incident fingerprint
+// -----------------------------------------------------------------------------
+
+// buildIncidentFingerprint creates deterministic incident identity from:
 //
-// Repeated reconciliation of the same incident therefore produces the same
+// Policy UID
+// +
+// Pod UID
+// +
+// Container
+// +
+// Incident type
+//
+// Therefore repeated reconciliation of the same incident generates the same
 // fingerprint.
 func buildIncidentFingerprint(
 	policy *opsv1alpha1.IncidentPolicy,
@@ -629,8 +748,8 @@ func buildIncidentFingerprint(
 	)
 }
 
-// incidentReportName converts the fingerprint into a short deterministic
-// Kubernetes resource name.
+// incidentReportName converts the SHA-256 fingerprint into a short,
+// deterministic Kubernetes object name.
 func incidentReportName(
 	fingerprint string,
 ) string {
@@ -646,7 +765,7 @@ func incidentReportName(
 }
 
 // -----------------------------------------------------------------------------
-// Helpers
+// Container state helper
 // -----------------------------------------------------------------------------
 
 func containerStateName(
@@ -666,6 +785,10 @@ func containerStateName(
 		return "Unknown"
 	}
 }
+
+// -----------------------------------------------------------------------------
+// IncidentPolicy status update helper
+// -----------------------------------------------------------------------------
 
 func (r *IncidentPolicyReconciler) updatePolicyStatusIfChanged(
 	ctx context.Context,
@@ -690,6 +813,8 @@ func (r *IncidentPolicyReconciler) updatePolicyStatusIfChanged(
 // Pod event mapping
 // -----------------------------------------------------------------------------
 
+// mapPodToIncidentPolicies maps a Pod event to every IncidentPolicy in the
+// same namespace whose selector matches the Pod.
 func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	ctx context.Context,
 	obj client.Object,

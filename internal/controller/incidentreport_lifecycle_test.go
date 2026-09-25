@@ -34,12 +34,12 @@ var _ = Describe("IncidentReport lifecycle", func() {
 		}
 	})
 
-	It("creates one Active IncidentReport and reuses it for repeated observations", func() {
+	// ---------------------------------------------------------------------
+	// TEST 1:
+	// Repeated observations of the same incident must reuse one report.
+	// ---------------------------------------------------------------------
 
-		// -----------------------------------------------------------------
-		// STEP 1:
-		// Create a Pod that is currently in CrashLoopBackOff.
-		// -----------------------------------------------------------------
+	It("creates one Active IncidentReport and reuses it for repeated observations", func() {
 
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -67,7 +67,7 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// envtest does not run kubelet, so we simulate the container status.
+		// envtest has no kubelet, so container status must be simulated.
 		pod.Status.ContainerStatuses = []corev1.ContainerStatus{
 			{
 				Name:         "app",
@@ -88,11 +88,6 @@ var _ = Describe("IncidentReport lifecycle", func() {
 				pod,
 			),
 		).To(Succeed())
-
-		// -----------------------------------------------------------------
-		// STEP 2:
-		// Create a policy that monitors this Pod.
-		// -----------------------------------------------------------------
 
 		policy := &opsv1alpha1.IncidentPolicy{
 			ObjectMeta: metav1.ObjectMeta{
@@ -120,15 +115,9 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// -----------------------------------------------------------------
-		// STEP 3:
+		// -------------------------------------------------------------
 		// First reconciliation.
-		//
-		// Expected:
-		// - CrashLoop detected
-		// - IncidentReport created
-		// - IncidentReport phase = Active
-		// -----------------------------------------------------------------
+		// -------------------------------------------------------------
 
 		updatedPolicy := reconcilePolicy(
 			policy.Name,
@@ -151,10 +140,9 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			incidentCondition.Reason,
 		).To(Equal("CrashLoopBackOffDetected"))
 
-		// -----------------------------------------------------------------
-		// STEP 4:
-		// List reports belonging to this policy.
-		// -----------------------------------------------------------------
+		// -------------------------------------------------------------
+		// Find the created IncidentReport.
+		// -------------------------------------------------------------
 
 		firstReports := &opsv1alpha1.IncidentReportList{}
 
@@ -173,17 +161,16 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// There must be exactly one report.
 		Expect(
 			firstReports.Items,
 		).To(HaveLen(1))
 
-		firstReport := &firstReports.Items[0]
+		firstReport :=
+			&firstReports.Items[0]
 
-		// -----------------------------------------------------------------
-		// STEP 5:
-		// Verify stable incident identity.
-		// -----------------------------------------------------------------
+		// -------------------------------------------------------------
+		// Verify stable identity.
+		// -------------------------------------------------------------
 
 		Expect(
 			firstReport.Spec.PolicyName,
@@ -219,10 +206,9 @@ var _ = Describe("IncidentReport lifecycle", func() {
 		firstFingerprint :=
 			firstReport.Spec.Fingerprint
 
-		// -----------------------------------------------------------------
-		// STEP 6:
-		// Verify lifecycle state.
-		// -----------------------------------------------------------------
+		// -------------------------------------------------------------
+		// Verify Active lifecycle.
+		// -------------------------------------------------------------
 
 		Expect(
 			firstReport.Status.Phase,
@@ -246,10 +232,9 @@ var _ = Describe("IncidentReport lifecycle", func() {
 		firstObservedTime :=
 			firstReport.Status.LastObservedAt.Time
 
-		// -----------------------------------------------------------------
-		// STEP 7:
+		// -------------------------------------------------------------
 		// Verify evidence.
-		// -----------------------------------------------------------------
+		// -------------------------------------------------------------
 
 		Expect(
 			firstReport.Status.Evidence.RestartCount,
@@ -263,19 +248,9 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			firstReport.Status.Evidence.WaitingReason,
 		).To(Equal("CrashLoopBackOff"))
 
-		// -----------------------------------------------------------------
-		// STEP 8:
-		// Simulate the same incident continuing.
-		//
-		// RestartCount increases, but this is still:
-		//
-		// same policy
-		// same Pod
-		// same container
-		// same incident type
-		//
-		// Therefore it must remain the same IncidentReport.
-		// -----------------------------------------------------------------
+		// -------------------------------------------------------------
+		// Same incident continues.
+		// -------------------------------------------------------------
 
 		pod.Status.ContainerStatuses[0].RestartCount = 4
 
@@ -286,19 +261,14 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// -----------------------------------------------------------------
-		// STEP 9:
-		// Reconcile the policy again.
-		// -----------------------------------------------------------------
-
+		// Second reconciliation.
 		reconcilePolicy(
 			policy.Name,
 		)
 
-		// -----------------------------------------------------------------
-		// STEP 10:
-		// List IncidentReports again.
-		// -----------------------------------------------------------------
+		// -------------------------------------------------------------
+		// List reports again.
+		// -------------------------------------------------------------
 
 		secondReports :=
 			&opsv1alpha1.IncidentReportList{}
@@ -318,7 +288,7 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(Succeed())
 
-		// Critical duplicate-prevention check.
+		// Critical duplicate-prevention assertion.
 		Expect(
 			secondReports.Items,
 		).To(HaveLen(1))
@@ -326,15 +296,12 @@ var _ = Describe("IncidentReport lifecycle", func() {
 		secondReport :=
 			&secondReports.Items[0]
 
-		// -----------------------------------------------------------------
-		// STEP 11:
-		// Verify this is exactly the same report.
-		// -----------------------------------------------------------------
-
+		// Same resource.
 		Expect(
 			secondReport.Name,
 		).To(Equal(firstReportName))
 
+		// Same fingerprint.
 		Expect(
 			secondReport.Spec.Fingerprint,
 		).To(Equal(firstFingerprint))
@@ -343,11 +310,7 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			secondReport.Status.Phase,
 		).To(Equal("Active"))
 
-		// -----------------------------------------------------------------
-		// STEP 12:
-		// FirstDetectedAt must remain unchanged.
-		// -----------------------------------------------------------------
-
+		// FirstDetectedAt must stay unchanged.
 		Expect(
 			secondReport.Status.FirstDetectedAt,
 		).NotTo(BeNil())
@@ -358,11 +321,7 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(BeTrue())
 
-		// -----------------------------------------------------------------
-		// STEP 13:
-		// LastObservedAt must not move backward.
-		// -----------------------------------------------------------------
-
+		// LastObservedAt must not move backwards.
 		Expect(
 			secondReport.Status.LastObservedAt,
 		).NotTo(BeNil())
@@ -373,11 +332,7 @@ var _ = Describe("IncidentReport lifecycle", func() {
 			),
 		).To(BeFalse())
 
-		// -----------------------------------------------------------------
-		// STEP 14:
 		// Evidence should refresh.
-		// -----------------------------------------------------------------
-
 		Expect(
 			secondReport.Status.Evidence.RestartCount,
 		).To(Equal(int32(4)))
@@ -393,5 +348,309 @@ var _ = Describe("IncidentReport lifecycle", func() {
 		Expect(
 			secondReport.Status.ResolvedAt,
 		).To(BeNil())
+	})
+
+	// ---------------------------------------------------------------------
+	// TEST 2:
+	// Active incident becomes Resolved when the failure disappears.
+	// ---------------------------------------------------------------------
+
+	It("marks an Active IncidentReport Resolved when the Pod becomes healthy", func() {
+
+		// -------------------------------------------------------------
+		// STEP 1:
+		// Create a crashing Pod.
+		// -------------------------------------------------------------
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "checkout-resolution-pod",
+				Namespace: controllerTestNamespace,
+				Labels: map[string]string{
+					"app": "checkout-resolution-test",
+				},
+			},
+
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "app",
+						Image: "busybox:1.36",
+					},
+				},
+			},
+		}
+
+		Expect(
+			k8sClient.Create(
+				ctx,
+				pod,
+			),
+		).To(Succeed())
+
+		pod.Status.ContainerStatuses =
+			[]corev1.ContainerStatus{
+				{
+					Name:         "app",
+					RestartCount: 5,
+
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "CrashLoopBackOff",
+							Message: "back-off restarting failed container",
+						},
+					},
+				},
+			}
+
+		Expect(
+			k8sClient.Status().Update(
+				ctx,
+				pod,
+			),
+		).To(Succeed())
+
+		// -------------------------------------------------------------
+		// STEP 2:
+		// Create policy.
+		// -------------------------------------------------------------
+
+		policy := &opsv1alpha1.IncidentPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "checkout-resolution-policy",
+				Namespace: controllerTestNamespace,
+			},
+
+			Spec: opsv1alpha1.IncidentPolicySpec{
+				Selector: metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "checkout-resolution-test",
+					},
+				},
+
+				Checks: opsv1alpha1.IncidentChecks{
+					CrashLoop: true,
+				},
+			},
+		}
+
+		Expect(
+			k8sClient.Create(
+				ctx,
+				policy,
+			),
+		).To(Succeed())
+
+		// -------------------------------------------------------------
+		// STEP 3:
+		// Detect the incident.
+		// -------------------------------------------------------------
+
+		reconcilePolicy(
+			policy.Name,
+		)
+
+		activeReports :=
+			&opsv1alpha1.IncidentReportList{}
+
+		Expect(
+			k8sClient.List(
+				ctx,
+				activeReports,
+
+				client.InNamespace(
+					controllerTestNamespace,
+				),
+
+				client.MatchingLabels{
+					reportPolicyUIDLabel: string(policy.UID),
+				},
+			),
+		).To(Succeed())
+
+		Expect(
+			activeReports.Items,
+		).To(HaveLen(1))
+
+		activeReport :=
+			&activeReports.Items[0]
+
+		Expect(
+			activeReport.Status.Phase,
+		).To(Equal("Active"))
+
+		Expect(
+			activeReport.Status.ResolvedAt,
+		).To(BeNil())
+
+		Expect(
+			activeReport.Status.FirstDetectedAt,
+		).NotTo(BeNil())
+
+		Expect(
+			activeReport.Status.LastObservedAt,
+		).NotTo(BeNil())
+
+		reportName :=
+			activeReport.Name
+
+		fingerprint :=
+			activeReport.Spec.Fingerprint
+
+		firstDetectedTime :=
+			activeReport.Status.FirstDetectedAt.Time
+
+		lastObservedTime :=
+			activeReport.Status.LastObservedAt.Time
+
+		restartCount :=
+			activeReport.Status.Evidence.RestartCount
+
+		// -------------------------------------------------------------
+		// STEP 4:
+		// Simulate recovery.
+		//
+		// The same container is now Running instead of
+		// CrashLoopBackOff.
+		// -------------------------------------------------------------
+
+		pod.Status.ContainerStatuses =
+			[]corev1.ContainerStatus{
+				{
+					Name:         "app",
+					RestartCount: 5,
+
+					State: corev1.ContainerState{
+						Running: &corev1.ContainerStateRunning{},
+					},
+				},
+			}
+
+		Expect(
+			k8sClient.Status().Update(
+				ctx,
+				pod,
+			),
+		).To(Succeed())
+
+		// -------------------------------------------------------------
+		// STEP 5:
+		// Reconcile after recovery.
+		// -------------------------------------------------------------
+
+		updatedPolicy :=
+			reconcilePolicy(
+				policy.Name,
+			)
+
+		// Policy should now say no incident is detected.
+		incidentCondition :=
+			apimeta.FindStatusCondition(
+				updatedPolicy.Status.Conditions,
+				conditionTypeIncidentDetected,
+			)
+
+		Expect(
+			incidentCondition,
+		).NotTo(BeNil())
+
+		Expect(
+			incidentCondition.Status,
+		).To(Equal(metav1.ConditionFalse))
+
+		Expect(
+			incidentCondition.Reason,
+		).To(Equal("NoIncidentDetected"))
+
+		// -------------------------------------------------------------
+		// STEP 6:
+		// The report must still exist.
+		// -------------------------------------------------------------
+
+		resolvedReports :=
+			&opsv1alpha1.IncidentReportList{}
+
+		Expect(
+			k8sClient.List(
+				ctx,
+				resolvedReports,
+
+				client.InNamespace(
+					controllerTestNamespace,
+				),
+
+				client.MatchingLabels{
+					reportPolicyUIDLabel: string(policy.UID),
+				},
+			),
+		).To(Succeed())
+
+		// We retain incident history.
+		Expect(
+			resolvedReports.Items,
+		).To(HaveLen(1))
+
+		resolvedReport :=
+			&resolvedReports.Items[0]
+
+		// -------------------------------------------------------------
+		// STEP 7:
+		// Verify same report identity.
+		// -------------------------------------------------------------
+
+		Expect(
+			resolvedReport.Name,
+		).To(Equal(reportName))
+
+		Expect(
+			resolvedReport.Spec.Fingerprint,
+		).To(Equal(fingerprint))
+
+		// -------------------------------------------------------------
+		// STEP 8:
+		// Verify lifecycle transition.
+		// -------------------------------------------------------------
+
+		Expect(
+			resolvedReport.Status.Phase,
+		).To(Equal("Resolved"))
+
+		Expect(
+			resolvedReport.Status.ResolvedAt,
+		).NotTo(BeNil())
+
+		// -------------------------------------------------------------
+		// STEP 9:
+		// Historical data must remain unchanged.
+		// -------------------------------------------------------------
+
+		Expect(
+			resolvedReport.Status.FirstDetectedAt,
+		).NotTo(BeNil())
+
+		Expect(
+			resolvedReport.Status.FirstDetectedAt.Time.Equal(
+				firstDetectedTime,
+			),
+		).To(BeTrue())
+
+		Expect(
+			resolvedReport.Status.LastObservedAt,
+		).NotTo(BeNil())
+
+		Expect(
+			resolvedReport.Status.LastObservedAt.Time.Equal(
+				lastObservedTime,
+			),
+		).To(BeTrue())
+
+		// Evidence from the incident should also be preserved.
+		Expect(
+			resolvedReport.Status.Evidence.RestartCount,
+		).To(Equal(restartCount))
+
+		Expect(
+			resolvedReport.Status.Evidence.WaitingReason,
+		).To(Equal("CrashLoopBackOff"))
 	})
 })
