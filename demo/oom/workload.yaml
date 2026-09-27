@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oom-demo
+  namespace: kubetriage-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oom-demo
+  template:
+    metadata:
+      labels:
+        app: oom-demo
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+          args:
+            - |
+              import time
+
+              print("KubeTriage OOM demo starting", flush=True)
+
+              chunks = []
+
+              while True:
+                  chunks.append(bytearray(1024 * 1024))
+                  print(
+                      f"allocated approximately {len(chunks)} MiB",
+                      flush=True
+                  )
+                  time.sleep(0.05)
+          resources:
+            requests:
+              memory: 16Mi
+              cpu: 10m
+            limits:
+              memory: 32Mi
+              cpu: 250m

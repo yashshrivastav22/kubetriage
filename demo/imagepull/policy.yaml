@@ -1,0 +1,13 @@
+apiVersion: ops.kubetriage.dev/v1alpha1
+kind: IncidentPolicy
+metadata:
+  name: imagepull-demo-policy
+  namespace: kubetriage-demo
+spec:
+  selector:
+    matchLabels:
+      app: imagepull-demo
+  checks:
+    crashLoop: false
+    oomKilled: false
+    imagePull: true

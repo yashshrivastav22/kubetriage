@@ -1,0 +1,13 @@
+apiVersion: ops.kubetriage.dev/v1alpha1
+kind: IncidentPolicy
+metadata:
+  name: oom-demo-policy
+  namespace: kubetriage-demo
+spec:
+  selector:
+    matchLabels:
+      app: oom-demo
+  checks:
+    crashLoop: false
+    oomKilled: true
+    imagePull: false
