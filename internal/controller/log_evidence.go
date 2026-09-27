@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	opsv1alpha1 "github.com/yashshrivastav22/kubetriage/api/v1alpha1"
 
@@ -24,34 +25,40 @@ func (r *IncidentPolicyReconciler) collectContainerLogEvidence(
 		return opsv1alpha1.IncidentLogEvidence{}, nil
 	}
 
-	now := metav1.Now()
+	now :=
+		metav1.Now()
 
-	evidence := opsv1alpha1.IncidentLogEvidence{
-		CollectedAt: &now,
-	}
+	evidence :=
+		opsv1alpha1.IncidentLogEvidence{
+			CollectedAt: &now,
+		}
 
 	var collectionErrors []error
-	anySuccessfulRead := false
 
-	// Request one byte beyond our storage limit.
+	anySuccessfulRead :=
+		false
+
+	// Request one byte beyond the final storage limit.
 	//
-	// This gives boundLogBytes an opportunity to determine whether the
-	// locally stored excerpt had to be truncated.
-	requestLimit := incidentLogLimitBytes + 1
+	// This allows KubeTriage to tell whether the stored excerpt had to be
+	// truncated.
+	requestLimit :=
+		incidentLogLimitBytes + 1
 
 	// ---------------------------------------------------------------------
 	// Current container logs.
 	// ---------------------------------------------------------------------
 
-	currentData, err := r.LogReader.ReadContainerLogs(
-		ctx,
-		namespace,
-		finding.PodName,
-		finding.ContainerName,
-		false,
-		incidentLogTailLines,
-		requestLimit,
-	)
+	currentData, err :=
+		r.LogReader.ReadContainerLogs(
+			ctx,
+			namespace,
+			finding.PodName,
+			finding.ContainerName,
+			false,
+			incidentLogTailLines,
+			requestLimit,
+		)
 
 	if err != nil {
 		collectionErrors = append(
@@ -64,21 +71,27 @@ func (r *IncidentPolicyReconciler) collectContainerLogEvidence(
 			),
 		)
 	} else {
-		current, truncated := boundLogBytes(
-			currentData,
-			int(incidentLogLimitBytes),
-		)
+		current, truncated :=
+			sanitizeBoundedLogBytes(
+				currentData,
+				int(incidentLogLimitBytes),
+			)
 
-		evidence.Current = current
-		evidence.CurrentTruncated = truncated
-		anySuccessfulRead = true
+		evidence.Current =
+			current
+
+		evidence.CurrentTruncated =
+			truncated
+
+		anySuccessfulRead =
+			true
 	}
 
 	// ---------------------------------------------------------------------
 	// Previous container logs.
 	//
-	// Previous logs are useful only when Kubernetes indicates that the
-	// container has restarted or has a previous termination.
+	// Previous logs are useful when Kubernetes reports evidence that this
+	// container has restarted or previously terminated.
 	// ---------------------------------------------------------------------
 
 	shouldCollectPrevious :=
@@ -108,23 +121,88 @@ func (r *IncidentPolicyReconciler) collectContainerLogEvidence(
 				),
 			)
 		} else {
-			previous, truncated := boundLogBytes(
-				previousData,
-				int(incidentLogLimitBytes),
-			)
+			previous, truncated :=
+				sanitizeBoundedLogBytes(
+					previousData,
+					int(incidentLogLimitBytes),
+				)
 
-			evidence.Previous = previous
-			evidence.PreviousTruncated = truncated
-			anySuccessfulRead = true
+			evidence.Previous =
+				previous
+
+			evidence.PreviousTruncated =
+				truncated
+
+			anySuccessfulRead =
+				true
 		}
 	}
 
-	// If every attempted read failed, return zero evidence. The caller can
-	// preserve any previously collected log evidence.
-	if !anySuccessfulRead && len(collectionErrors) > 0 {
+	// Every requested log operation failed.
+	//
+	// Return zero evidence so the caller can preserve an older successful
+	// collection rather than overwriting it.
+	if !anySuccessfulRead &&
+		len(collectionErrors) > 0 {
+
 		return opsv1alpha1.IncidentLogEvidence{},
 			errors.Join(collectionErrors...)
 	}
 
-	return evidence, errors.Join(collectionErrors...)
+	// Partial success returns both useful evidence and an error so the caller
+	// can record an evidence-collection failure metric without discarding the
+	// successful portion.
+	return evidence,
+		errors.Join(collectionErrors...)
+}
+
+// sanitizeBoundedLogBytes creates the final safe log representation stored in
+// IncidentReport.status.
+//
+// Ordering matters:
+//
+//	raw Kubernetes logs
+//	        ↓
+//	make UTF-8 safe
+//	        ↓
+//	redact likely secrets
+//	        ↓
+//	enforce final byte limit
+//
+// Sanitization occurs before the final size bound so credentials near the
+// boundary cannot escape redaction merely because truncation split a pattern.
+func sanitizeBoundedLogBytes(
+	data []byte,
+	limit int,
+) (string, bool) {
+	if limit <= 0 {
+		return "", len(data) > 0
+	}
+
+	// Pod logs should normally be UTF-8 text, but the storage boundary should
+	// not trust that assumption. Invalid sequences are removed.
+	validText :=
+		strings.ToValidUTF8(
+			string(data),
+			"",
+		)
+
+	sanitized :=
+		sanitizeEvidenceText(
+			validText,
+		)
+
+	bounded, sanitizedTruncated :=
+		boundLogBytes(
+			[]byte(sanitized),
+			limit,
+		)
+
+	// Preserve the fact that the original response exceeded our storage
+	// boundary even if redaction later shortened the text.
+	sourceTruncated :=
+		len(data) > limit
+
+	return bounded,
+		sourceTruncated || sanitizedTruncated
 }

@@ -18,11 +18,8 @@ const (
 	maxIncidentEventNoteRunes = 1024
 )
 
-// collectPodEventEvidence collects a bounded set of Kubernetes Events
-// associated with one Pod.
-//
-// Events are supplemental evidence. They are not used to decide whether
-// an incident exists.
+// collectPodEventEvidence collects a bounded set of Kubernetes Events that
+// belong to the exact Pod instance identified by podUID.
 func (r *IncidentPolicyReconciler) collectPodEventEvidence(
 	ctx context.Context,
 	namespace string,
@@ -43,13 +40,13 @@ func (r *IncidentPolicyReconciler) collectPodEventEvidence(
 		0,
 	)
 
-	// Match by Pod UID rather than Pod name.
-	//
-	// Pod names can theoretically be reused, but UID identifies the exact
-	// Pod instance involved in this incident.
 	for i := range eventList.Items {
 		event := &eventList.Items[i]
 
+		// Match the exact Pod instance, not merely the Pod name.
+		//
+		// A deleted/recreated Pod may reuse a name but always receives a
+		// different UID.
 		if event.Regarding.UID != types.UID(podUID) {
 			continue
 		}
@@ -64,21 +61,20 @@ func (r *IncidentPolicyReconciler) collectPodEventEvidence(
 	sort.SliceStable(
 		matchingEvents,
 		func(i int, j int) bool {
-			left :=
-				eventLastObservedTime(
-					&matchingEvents[i],
-				)
+			left := eventLastObservedTime(
+				&matchingEvents[i],
+			)
 
-			right :=
-				eventLastObservedTime(
-					&matchingEvents[j],
-				)
+			right := eventLastObservedTime(
+				&matchingEvents[j],
+			)
 
-			return left.Time.After(right.Time)
+			return left.Time.After(
+				right.Time,
+			)
 		},
 	)
 
-	// Keep IncidentReport bounded.
 	if len(matchingEvents) > maxIncidentEvents {
 		matchingEvents =
 			matchingEvents[:maxIncidentEvents]
@@ -101,9 +97,9 @@ func (r *IncidentPolicyReconciler) collectPodEventEvidence(
 		lastObserved :=
 			firstObserved
 
-		count := int32(1)
+		count :=
+			int32(1)
 
-		// EventSeries represents a repeating Event.
 		if event.Series != nil {
 			count =
 				event.Series.Count
@@ -123,7 +119,10 @@ func (r *IncidentPolicyReconciler) collectPodEventEvidence(
 
 				Action: event.Action,
 
-				Note: truncateRunes(
+				// Security boundary:
+				// Kubernetes Event notes are untrusted workload/runtime
+				// text. Redact likely secrets before storing them.
+				Note: sanitizeAndTruncateEvidence(
 					event.Note,
 					maxIncidentEventNoteRunes,
 				),
@@ -142,8 +141,6 @@ func (r *IncidentPolicyReconciler) collectPodEventEvidence(
 	return evidence, nil
 }
 
-// eventLastObservedTime returns the best available timestamp for sorting
-// Events from newest to oldest.
 func eventLastObservedTime(
 	event *eventsv1.Event,
 ) metav1.Time {
@@ -158,13 +155,20 @@ func eventLastObservedTime(
 	)
 }
 
-// truncateRunes limits human-readable Event notes without splitting
-// multi-byte UTF-8 characters.
+// truncateRunes truncates text by Unicode code points rather than bytes.
+//
+// Kubernetes CRD MaxLength validation is character-oriented, and evidence may
+// contain multi-byte UTF-8 characters.
 func truncateRunes(
 	value string,
 	limit int,
 ) string {
-	runes := []rune(value)
+	if limit <= 0 {
+		return ""
+	}
+
+	runes :=
+		[]rune(value)
 
 	if len(runes) <= limit {
 		return value
