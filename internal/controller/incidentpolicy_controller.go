@@ -28,11 +28,20 @@ const (
 	conditionTypeReady            = "Ready"
 	conditionTypeIncidentDetected = "IncidentDetected"
 
-	reportPolicyUIDLabel    = "ops.kubetriage.dev/policy-uid"
+	reportPolicyUIDLabel = "ops.kubetriage.dev/policy-uid"
+
 	reportIncidentTypeLabel = "ops.kubetriage.dev/incident-type"
 )
 
-// incidentFinding represents one normalized incident detected from Pod status.
+// -----------------------------------------------------------------------------
+// incidentFinding
+//
+// Internal normalized representation returned by the detection engine.
+//
+// Richer evidence is intentionally collected separately so detector logic stays
+// deterministic and focused on identifying incident conditions.
+// -----------------------------------------------------------------------------
+
 type incidentFinding struct {
 	PodName       string
 	PodUID        string
@@ -47,10 +56,19 @@ type incidentFinding struct {
 	ExitCode              *int32
 }
 
-// IncidentPolicyReconciler reconciles an IncidentPolicy object.
+// -----------------------------------------------------------------------------
+// IncidentPolicyReconciler
+// -----------------------------------------------------------------------------
+
 type IncidentPolicyReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
+
+	Scheme *runtime.Scheme
+
+	// LogReader abstracts access to the Kubernetes pods/log subresource.
+	//
+	// Production initializes the Kubernetes implementation in
+	// SetupWithManager. Tests may inject a deterministic fake implementation.
 	LogReader LogReader
 }
 
@@ -66,142 +84,195 @@ type IncidentPolicyReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=get;list;watch
 
+// -----------------------------------------------------------------------------
+// Reconcile metrics wrapper
+//
+// All reconciliation paths flow through this wrapper so success/error counts
+// and duration are recorded consistently.
+// -----------------------------------------------------------------------------
+
 func (r *IncidentPolicyReconciler) Reconcile(
 	ctx context.Context,
 	req ctrl.Request,
 ) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
+	startedAt := time.Now()
+
+	result, err := r.reconcile(
+		ctx,
+		req,
+	)
+
+	reconcileDuration.Observe(
+		time.Since(startedAt).Seconds(),
+	)
+
+	if err != nil {
+		reconcileTotal.WithLabelValues(
+			"error",
+		).Inc()
+
+		return result, err
+	}
+
+	reconcileTotal.WithLabelValues(
+		"success",
+	).Inc()
+
+	return result, nil
+}
+
+// -----------------------------------------------------------------------------
+// Core reconciliation
+// -----------------------------------------------------------------------------
+
+func (r *IncidentPolicyReconciler) reconcile(
+	ctx context.Context,
+	req ctrl.Request,
+) (ctrl.Result, error) {
+	policy :=
+		&opsv1alpha1.IncidentPolicy{}
 
 	// ---------------------------------------------------------------------
-	// STEP 1: Retrieve IncidentPolicy.
+	// STEP 1:
+	// Load the IncidentPolicy.
+	//
+	// NotFound is normal because an object may have been deleted after its
+	// reconcile request was queued.
 	// ---------------------------------------------------------------------
-
-	policy := &opsv1alpha1.IncidentPolicy{}
 
 	if err := r.Get(
 		ctx,
 		req.NamespacedName,
 		policy,
 	); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	before := policy.DeepCopy()
-
-	policy.Status.ObservedGeneration = policy.Generation
-
-	// ---------------------------------------------------------------------
-	// STEP 2: Convert the label selector.
-	// ---------------------------------------------------------------------
-
-	selector, err := metav1.LabelSelectorAsSelector(
-		&policy.Spec.Selector,
-	)
-
-	if err != nil {
-		policy.Status.MonitoredPods = 0
-
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeReady,
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: policy.Generation,
-				Reason:             "InvalidSelector",
-				Message:            err.Error(),
-			},
-		)
-
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeIncidentDetected,
-				Status:             metav1.ConditionUnknown,
-				ObservedGeneration: policy.Generation,
-				Reason:             "EvaluationFailed",
-				Message:            "Incident evaluation could not be completed.",
-			},
-		)
-
-		if err := r.updatePolicyStatusIfChanged(
-			ctx,
-			before,
-			policy,
-		); err != nil {
-			return ctrl.Result{}, err
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
 		}
 
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, fmt.Errorf(
+			"get IncidentPolicy %s/%s: %w",
+			req.Namespace,
+			req.Name,
+			err,
+		)
+	}
+
+	before :=
+		policy.DeepCopy()
+
+	policy.Status.ObservedGeneration =
+		policy.Generation
+
+	// ---------------------------------------------------------------------
+	// STEP 2:
+	// Convert the Kubernetes LabelSelector.
+	// ---------------------------------------------------------------------
+
+	selector, err :=
+		metav1.LabelSelectorAsSelector(
+			&policy.Spec.Selector,
+		)
+
+	if err != nil {
+		setPolicyCondition(
+			policy,
+			conditionTypeReady,
+			metav1.ConditionFalse,
+			"InvalidSelector",
+			fmt.Sprintf(
+				"IncidentPolicy selector could not be evaluated: %v",
+				err,
+			),
+		)
+
+		setPolicyCondition(
+			policy,
+			conditionTypeIncidentDetected,
+			metav1.ConditionUnknown,
+			"EvaluationFailed",
+			"Incident detection could not run because the selector is invalid.",
+		)
+
+		if patchErr :=
+			r.patchIncidentPolicyStatus(
+				ctx,
+				before,
+				policy,
+			); patchErr != nil {
+
+			return ctrl.Result{}, patchErr
+		}
+
+		return ctrl.Result{}, fmt.Errorf(
+			"convert IncidentPolicy selector: %w",
+			err,
+		)
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 3: Find every Pod matching this IncidentPolicy.
+	// STEP 3:
+	// Discover matching Pods in the same namespace.
 	// ---------------------------------------------------------------------
 
-	pods := &corev1.PodList{}
+	pods :=
+		&corev1.PodList{}
 
 	if err := r.List(
 		ctx,
 		pods,
-		client.InNamespace(policy.Namespace),
+		client.InNamespace(
+			policy.Namespace,
+		),
 		client.MatchingLabelsSelector{
 			Selector: selector,
 		},
 	); err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf(
+			"list Pods for IncidentPolicy %s/%s: %w",
+			policy.Namespace,
+			policy.Name,
+			err,
+		)
 	}
 
-	policy.Status.MonitoredPods = int32(
-		len(pods.Items),
-	)
-
-	log.Info(
-		"evaluating IncidentPolicy",
-		"policy",
-		policy.Name,
-		"namespace",
-		policy.Namespace,
-		"matchingPods",
-		len(pods.Items),
-	)
+	policy.Status.MonitoredPods =
+		int32(len(pods.Items))
 
 	// ---------------------------------------------------------------------
-	// STEP 4: No matching Pods.
+	// STEP 4:
+	// No matching Pods.
 	//
-	// We intentionally DO NOT resolve existing reports here.
+	// This is UNKNOWN incident state, not proof of recovery.
 	//
-	// No matching Pods means the application state is unknown. It does not
-	// prove that an existing incident has recovered.
+	// We intentionally DO NOT resolve IncidentReports here because a missing
+	// Pod may have been deleted/recreated, temporarily unavailable, or not yet
+	// scheduled.
 	// ---------------------------------------------------------------------
 
 	if len(pods.Items) == 0 {
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeReady,
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: policy.Generation,
-				Reason:             "NoMatchingPods",
-				Message:            "The policy selector currently matches no Pods.",
-			},
-		)
-
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeIncidentDetected,
-				Status:             metav1.ConditionUnknown,
-				ObservedGeneration: policy.Generation,
-				Reason:             "NoMatchingPods",
-				Message:            "Incident state cannot be determined because no Pods match the selector.",
-			},
-		)
-
-		if err := r.updatePolicyStatusIfChanged(
-			ctx,
-			before,
+		setPolicyCondition(
 			policy,
-		); err != nil {
+			conditionTypeReady,
+			metav1.ConditionFalse,
+			"NoMatchingPods",
+			"No Pods currently match the IncidentPolicy selector.",
+		)
+
+		setPolicyCondition(
+			policy,
+			conditionTypeIncidentDetected,
+			metav1.ConditionUnknown,
+			"NoMatchingPods",
+			"Incident state is unknown because no Pods currently match the selector.",
+		)
+
+		if err :=
+			r.patchIncidentPolicyStatus(
+				ctx,
+				before,
+				policy,
+			); err != nil {
+
 			return ctrl.Result{}, err
 		}
 
@@ -210,34 +281,24 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		}, nil
 	}
 
-	// ---------------------------------------------------------------------
-	// STEP 5: The policy can be evaluated.
-	// ---------------------------------------------------------------------
-
-	apimeta.SetStatusCondition(
-		&policy.Status.Conditions,
-		metav1.Condition{
-			Type:               conditionTypeReady,
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: policy.Generation,
-			Reason:             "EvaluationReady",
-			Message:            "All configured incident checks can be evaluated.",
-		},
+	// Matching Pods exist, so evaluation can proceed.
+	setPolicyCondition(
+		policy,
+		conditionTypeReady,
+		metav1.ConditionTrue,
+		"EvaluationReady",
+		"Matching Pods are available for incident evaluation.",
 	)
 
 	// ---------------------------------------------------------------------
-	// STEP 6:
-	// Run ALL enabled detectors.
+	// STEP 5:
+	// Run every enabled detector.
 	//
-	// Previously KubeTriage returned only one *incidentFinding.
-	//
-	// Now every detector can return multiple findings.
+	// Detectors return ALL findings rather than only the first failure.
 	// ---------------------------------------------------------------------
 
-	findings := make(
-		[]incidentFinding,
-		0,
-	)
+	findings :=
+		make([]incidentFinding, 0)
 
 	if policy.Spec.Checks.CrashLoop {
 		findings = append(
@@ -267,11 +328,8 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 7:
-	// Create/update every currently observed incident.
-	//
-	// observedFingerprints represents the incident state of the cluster
-	// during THIS reconciliation.
+	// STEP 6:
+	// Build the currently observed incident set.
 	// ---------------------------------------------------------------------
 
 	observedFingerprints :=
@@ -280,13 +338,23 @@ func (r *IncidentPolicyReconciler) Reconcile(
 	activeFindings :=
 		make([]incidentFinding, 0)
 
-	for i := range findings {
-		finding := &findings[i]
+	// ---------------------------------------------------------------------
+	// STEP 7:
+	// Create/update every currently observed incident.
+	//
+	// observedFingerprints represents the incident state of the cluster
+	// during THIS reconciliation.
+	// ---------------------------------------------------------------------
 
-		fingerprint := buildIncidentFingerprint(
-			policy,
-			finding,
-		)
+	for i := range findings {
+		finding :=
+			&findings[i]
+
+		fingerprint :=
+			buildIncidentFingerprint(
+				policy,
+				finding,
+			)
 
 		// Defensive de-duplication.
 		//
@@ -294,17 +362,32 @@ func (r *IncidentPolicyReconciler) Reconcile(
 		// process it only once during this reconciliation.
 		if _, alreadyObserved :=
 			observedFingerprints[fingerprint]; alreadyObserved {
+
 			continue
 		}
 
-		if err := r.ensureIncidentReport(
-			ctx,
-			policy,
-			finding,
-			fingerprint,
-		); err != nil {
+		if err :=
+			r.ensureIncidentReport(
+				ctx,
+				policy,
+				finding,
+				fingerprint,
+			); err != nil {
+
 			return ctrl.Result{}, err
 		}
+
+		// -----------------------------------------------------------------
+		// Phase 6.2C:
+		// Incident observation metric.
+		//
+		// Increment only after the IncidentReport was successfully
+		// processed.
+		// -----------------------------------------------------------------
+
+		incidentsDetectedTotal.WithLabelValues(
+			finding.IncidentType,
+		).Inc()
 
 		observedFingerprints[fingerprint] =
 			struct{}{}
@@ -317,145 +400,245 @@ func (r *IncidentPolicyReconciler) Reconcile(
 
 	// ---------------------------------------------------------------------
 	// STEP 8:
-	// Resolve only reports that were NOT observed during this reconciliation.
-	//
-	// This is what allows independent incident lifecycle management.
+	// Resolve reports that were previously Active but are no longer observed.
 	// ---------------------------------------------------------------------
 
-	if err := r.resolveUnobservedIncidentReports(
-		ctx,
-		policy,
-		observedFingerprints,
-	); err != nil {
+	if err :=
+		r.resolveUnobservedIncidentReports(
+			ctx,
+			policy,
+			observedFingerprints,
+		); err != nil {
+
 		return ctrl.Result{}, err
 	}
 
 	// ---------------------------------------------------------------------
 	// STEP 9:
-	// Publish summary state on IncidentPolicy.
+	// Summarize active incidents on IncidentPolicy.status.
 	//
-	// IncidentPolicy is the summary.
-	// IncidentReport objects hold the detailed per-incident state.
+	// IncidentPolicy is the current summary.
+	// IncidentReport objects retain the detailed history.
 	// ---------------------------------------------------------------------
 
 	switch len(activeFindings) {
 	case 0:
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeIncidentDetected,
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: policy.Generation,
-				Reason:             "NoIncidentDetected",
-				Message:            "No configured incident condition was detected.",
-			},
+		setPolicyCondition(
+			policy,
+			conditionTypeIncidentDetected,
+			metav1.ConditionFalse,
+			"NoIncidentDetected",
+			"No enabled incident checks are currently detecting an incident.",
 		)
 
 	case 1:
-		finding := activeFindings[0]
+		finding :=
+			activeFindings[0]
 
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeIncidentDetected,
-				Status:             metav1.ConditionTrue,
-				ObservedGeneration: policy.Generation,
-				Reason:             finding.IncidentType + "Detected",
-				Message:            finding.Message,
-			},
+		setPolicyCondition(
+			policy,
+			conditionTypeIncidentDetected,
+			metav1.ConditionTrue,
+			finding.IncidentType+"Detected",
+			finding.Message,
 		)
 
 	default:
-		apimeta.SetStatusCondition(
-			&policy.Status.Conditions,
-			metav1.Condition{
-				Type:               conditionTypeIncidentDetected,
-				Status:             metav1.ConditionTrue,
-				ObservedGeneration: policy.Generation,
-				Reason:             "MultipleIncidentsDetected",
-				Message: fmt.Sprintf(
-					"%d active incidents were detected across matching Pods.",
-					len(activeFindings),
-				),
-			},
+		setPolicyCondition(
+			policy,
+			conditionTypeIncidentDetected,
+			metav1.ConditionTrue,
+			"MultipleIncidentsDetected",
+			fmt.Sprintf(
+				"%d active incidents were detected across matching Pods.",
+				len(activeFindings),
+			),
 		)
 	}
 
 	// ---------------------------------------------------------------------
-	// STEP 10: Persist IncidentPolicy status.
+	// STEP 10:
+	// Persist IncidentPolicy status only when it changed.
 	// ---------------------------------------------------------------------
 
-	if err := r.updatePolicyStatusIfChanged(
-		ctx,
-		before,
-		policy,
-	); err != nil {
+	if err :=
+		r.patchIncidentPolicyStatus(
+			ctx,
+			before,
+			policy,
+		); err != nil {
+
 		return ctrl.Result{}, err
 	}
 
-	// ---------------------------------------------------------------------
-	// STEP 11: Periodic reconciliation fallback.
-	// ---------------------------------------------------------------------
-
+	// Event-driven Pod watches are the primary trigger.
+	//
+	// The periodic fallback ensures reconciliation still happens if an
+	// external event is missed and also refreshes supplemental evidence.
 	return ctrl.Result{
 		RequeueAfter: 30 * time.Second,
 	}, nil
 }
 
 // -----------------------------------------------------------------------------
-// CrashLoopBackOff detector
+// IncidentPolicy status helpers
 // -----------------------------------------------------------------------------
 
-// findCrashLoopBackOff returns every CrashLoopBackOff currently visible in
-// the selected Pods.
+func setPolicyCondition(
+	policy *opsv1alpha1.IncidentPolicy,
+	conditionType string,
+	status metav1.ConditionStatus,
+	reason string,
+	message string,
+) {
+	apimeta.SetStatusCondition(
+		&policy.Status.Conditions,
+		metav1.Condition{
+			Type:               conditionType,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: policy.Generation,
+		},
+	)
+}
+
+func (r *IncidentPolicyReconciler) patchIncidentPolicyStatus(
+	ctx context.Context,
+	before *opsv1alpha1.IncidentPolicy,
+	policy *opsv1alpha1.IncidentPolicy,
+) error {
+	if reflect.DeepEqual(
+		before.Status,
+		policy.Status,
+	) {
+		return nil
+	}
+
+	if err := r.Status().Patch(
+		ctx,
+		policy,
+		client.MergeFrom(before),
+	); err != nil {
+		return fmt.Errorf(
+			"patch IncidentPolicy status %s/%s: %w",
+			policy.Namespace,
+			policy.Name,
+			err,
+		)
+	}
+
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// CrashLoopBackOff detection
+// -----------------------------------------------------------------------------
+
 func findCrashLoopBackOff(
 	pods []corev1.Pod,
 ) []incidentFinding {
-	findings := make(
-		[]incidentFinding,
-		0,
-	)
+	findings :=
+		make([]incidentFinding, 0)
 
 	for i := range pods {
-		pod := &pods[i]
+		pod :=
+			&pods[i]
 
-		statusGroups := [][]corev1.ContainerStatus{
-			pod.Status.InitContainerStatuses,
-			pod.Status.ContainerStatuses,
+		for j := range pod.Status.InitContainerStatuses {
+			status :=
+				&pod.Status.InitContainerStatuses[j]
+
+			if status.State.Waiting == nil {
+				continue
+			}
+
+			if status.State.Waiting.Reason !=
+				"CrashLoopBackOff" {
+
+				continue
+			}
+
+			findings = append(
+				findings,
+				incidentFinding{
+					PodName: pod.Name,
+
+					PodUID: string(pod.UID),
+
+					ContainerName: status.Name,
+
+					IncidentType: "CrashLoopBackOff",
+
+					Message: fmt.Sprintf(
+						"Container %s in Pod %s is repeatedly failing with CrashLoopBackOff.",
+						status.Name,
+						pod.Name,
+					),
+
+					RestartCount: status.RestartCount,
+
+					CurrentState: "Waiting",
+
+					WaitingReason: status.State.Waiting.Reason,
+
+					LastTerminationReason: containerLastTerminationReason(
+						status,
+					),
+
+					ExitCode: containerLastExitCode(
+						status,
+					),
+				},
+			)
 		}
 
-		for _, statuses := range statusGroups {
-			for _, containerStatus := range statuses {
-				waiting :=
-					containerStatus.State.Waiting
+		for j := range pod.Status.ContainerStatuses {
+			status :=
+				&pod.Status.ContainerStatuses[j]
 
-				if waiting == nil ||
-					waiting.Reason != "CrashLoopBackOff" {
-					continue
-				}
-
-				findings = append(
-					findings,
-					incidentFinding{
-						PodName:       pod.Name,
-						PodUID:        string(pod.UID),
-						ContainerName: containerStatus.Name,
-						IncidentType:  "CrashLoopBackOff",
-
-						Message: fmt.Sprintf(
-							"Pod %s container %s is in CrashLoopBackOff.",
-							pod.Name,
-							containerStatus.Name,
-						),
-
-						RestartCount: containerStatus.RestartCount,
-
-						CurrentState: "Waiting",
-
-						WaitingReason: waiting.Reason,
-					},
-				)
+			if status.State.Waiting == nil {
+				continue
 			}
+
+			if status.State.Waiting.Reason !=
+				"CrashLoopBackOff" {
+
+				continue
+			}
+
+			findings = append(
+				findings,
+				incidentFinding{
+					PodName: pod.Name,
+
+					PodUID: string(pod.UID),
+
+					ContainerName: status.Name,
+
+					IncidentType: "CrashLoopBackOff",
+
+					Message: fmt.Sprintf(
+						"Container %s in Pod %s is repeatedly failing with CrashLoopBackOff.",
+						status.Name,
+						pod.Name,
+					),
+
+					RestartCount: status.RestartCount,
+
+					CurrentState: "Waiting",
+
+					WaitingReason: status.State.Waiting.Reason,
+
+					LastTerminationReason: containerLastTerminationReason(
+						status,
+					),
+
+					ExitCode: containerLastExitCode(
+						status,
+					),
+				},
+			)
 		}
 	}
 
@@ -463,62 +646,84 @@ func findCrashLoopBackOff(
 }
 
 // -----------------------------------------------------------------------------
-// OOMKilled detector
+// OOMKilled detection
 // -----------------------------------------------------------------------------
 
-// findOOMKilled returns every currently observable OOMKilled incident.
 func findOOMKilled(
 	pods []corev1.Pod,
 ) []incidentFinding {
-	findings := make(
-		[]incidentFinding,
-		0,
-	)
+	findings :=
+		make([]incidentFinding, 0)
 
 	for i := range pods {
-		pod := &pods[i]
+		pod :=
+			&pods[i]
 
-		statusGroups := [][]corev1.ContainerStatus{
-			pod.Status.InitContainerStatuses,
-			pod.Status.ContainerStatuses,
+		for j := range pod.Status.InitContainerStatuses {
+			status :=
+				&pod.Status.InitContainerStatuses[j]
+
+			if status.State.Terminated != nil &&
+				status.State.Terminated.Reason == "OOMKilled" {
+
+				findings = append(
+					findings,
+					newOOMKilledFinding(
+						pod,
+						status,
+						status.State.Terminated,
+					),
+				)
+
+				continue
+			}
+
+			if status.LastTerminationState.Terminated != nil &&
+				status.LastTerminationState.Terminated.Reason ==
+					"OOMKilled" {
+
+				findings = append(
+					findings,
+					newOOMKilledFinding(
+						pod,
+						status,
+						status.LastTerminationState.Terminated,
+					),
+				)
+			}
 		}
 
-		for _, statuses := range statusGroups {
-			for _, containerStatus := range statuses {
-				currentTermination :=
-					containerStatus.State.Terminated
+		for j := range pod.Status.ContainerStatuses {
+			status :=
+				&pod.Status.ContainerStatuses[j]
 
-				if currentTermination != nil &&
-					currentTermination.Reason == "OOMKilled" {
-					findings = append(
-						findings,
-						newOOMKilledFinding(
-							pod,
-							containerStatus,
-							currentTermination,
-						),
-					)
+			if status.State.Terminated != nil &&
+				status.State.Terminated.Reason == "OOMKilled" {
 
-					// Avoid creating the same OOM finding twice if both
-					// current and previous termination states happen to
-					// contain OOMKilled.
-					continue
-				}
+				findings = append(
+					findings,
+					newOOMKilledFinding(
+						pod,
+						status,
+						status.State.Terminated,
+					),
+				)
 
-				lastTermination :=
-					containerStatus.LastTerminationState.Terminated
+				continue
+			}
 
-				if lastTermination != nil &&
-					lastTermination.Reason == "OOMKilled" {
-					findings = append(
-						findings,
-						newOOMKilledFinding(
-							pod,
-							containerStatus,
-							lastTermination,
-						),
-					)
-				}
+			if status.LastTerminationState.Terminated != nil &&
+				status.LastTerminationState.Terminated.Reason ==
+					"OOMKilled" {
+
+				findings = append(
+					findings,
+					newOOMKilledFinding(
+						pod,
+						status,
+						status.LastTerminationState.Terminated,
+					),
+				)
 			}
 		}
 	}
@@ -528,96 +733,86 @@ func findOOMKilled(
 
 func newOOMKilledFinding(
 	pod *corev1.Pod,
-	containerStatus corev1.ContainerStatus,
+	status *corev1.ContainerStatus,
 	termination *corev1.ContainerStateTerminated,
 ) incidentFinding {
-	exitCode := termination.ExitCode
+	exitCode :=
+		termination.ExitCode
 
 	return incidentFinding{
-		PodName:       pod.Name,
-		PodUID:        string(pod.UID),
-		ContainerName: containerStatus.Name,
-		IncidentType:  "OOMKilled",
+		PodName: pod.Name,
+
+		PodUID: string(pod.UID),
+
+		ContainerName: status.Name,
+
+		IncidentType: "OOMKilled",
 
 		Message: fmt.Sprintf(
-			"Pod %s container %s was terminated with reason OOMKilled.",
+			"Container %s in Pod %s was terminated with reason OOMKilled.",
+			status.Name,
 			pod.Name,
-			containerStatus.Name,
 		),
 
-		RestartCount: containerStatus.RestartCount,
+		RestartCount: status.RestartCount,
 
 		CurrentState: containerStateName(
-			containerStatus.State,
+			status.State,
 		),
 
-		LastTerminationReason: "OOMKilled",
+		LastTerminationReason: termination.Reason,
 
 		ExitCode: &exitCode,
 	}
 }
 
 // -----------------------------------------------------------------------------
-// Image pull detector
+// Image pull failure detection
 // -----------------------------------------------------------------------------
 
-// findImagePullFailures returns every ErrImagePull or ImagePullBackOff
-// currently visible in the selected Pods.
 func findImagePullFailures(
 	pods []corev1.Pod,
 ) []incidentFinding {
-	findings := make(
-		[]incidentFinding,
-		0,
-	)
+	findings :=
+		make([]incidentFinding, 0)
 
 	for i := range pods {
-		pod := &pods[i]
+		pod :=
+			&pods[i]
 
-		statusGroups := [][]corev1.ContainerStatus{
-			pod.Status.InitContainerStatuses,
-			pod.Status.ContainerStatuses,
+		for j := range pod.Status.InitContainerStatuses {
+			status :=
+				&pod.Status.InitContainerStatuses[j]
+
+			finding, found :=
+				imagePullFinding(
+					pod,
+					status,
+				)
+
+			if found {
+				findings = append(
+					findings,
+					finding,
+				)
+			}
 		}
 
-		for _, statuses := range statusGroups {
-			for _, containerStatus := range statuses {
-				waiting :=
-					containerStatus.State.Waiting
+		for j := range pod.Status.ContainerStatuses {
+			status :=
+				&pod.Status.ContainerStatuses[j]
 
-				if waiting == nil {
-					continue
-				}
+			finding, found :=
+				imagePullFinding(
+					pod,
+					status,
+				)
 
-				switch waiting.Reason {
-				case "ErrImagePull",
-					"ImagePullBackOff":
-
-					findings = append(
-						findings,
-						incidentFinding{
-							PodName: pod.Name,
-
-							PodUID: string(pod.UID),
-
-							ContainerName: containerStatus.Name,
-
-							IncidentType: waiting.Reason,
-
-							Message: fmt.Sprintf(
-								"Pod %s container %s cannot pull its image: %s.",
-								pod.Name,
-								containerStatus.Name,
-								waiting.Reason,
-							),
-
-							RestartCount: containerStatus.RestartCount,
-
-							CurrentState: "Waiting",
-
-							WaitingReason: waiting.Reason,
-						},
-					)
-				}
+			if found {
+				findings = append(
+					findings,
+					finding,
+				)
 			}
 		}
 	}
@@ -625,8 +820,164 @@ func findImagePullFailures(
 	return findings
 }
 
+func imagePullFinding(
+	pod *corev1.Pod,
+	status *corev1.ContainerStatus,
+) (incidentFinding, bool) {
+	if status.State.Waiting == nil {
+		return incidentFinding{}, false
+	}
+
+	reason :=
+		status.State.Waiting.Reason
+
+	if reason != "ErrImagePull" &&
+		reason != "ImagePullBackOff" {
+
+		return incidentFinding{}, false
+	}
+
+	return incidentFinding{
+		PodName: pod.Name,
+
+		PodUID: string(pod.UID),
+
+		ContainerName: status.Name,
+
+		IncidentType: reason,
+
+		Message: fmt.Sprintf(
+			"Container %s in Pod %s cannot pull its image: %s.",
+			status.Name,
+			pod.Name,
+			reason,
+		),
+
+		RestartCount: status.RestartCount,
+
+		CurrentState: "Waiting",
+
+		WaitingReason: reason,
+
+		LastTerminationReason: containerLastTerminationReason(
+			status,
+		),
+
+		ExitCode: containerLastExitCode(
+			status,
+		),
+	}, true
+}
+
 // -----------------------------------------------------------------------------
-// IncidentReport create/update lifecycle
+// Container state helpers
+// -----------------------------------------------------------------------------
+
+func containerStateName(
+	state corev1.ContainerState,
+) string {
+	switch {
+	case state.Waiting != nil:
+		return "Waiting"
+
+	case state.Running != nil:
+		return "Running"
+
+	case state.Terminated != nil:
+		return "Terminated"
+
+	default:
+		return "Unknown"
+	}
+}
+
+func containerLastTerminationReason(
+	status *corev1.ContainerStatus,
+) string {
+	if status.State.Terminated != nil {
+		return status.State.Terminated.Reason
+	}
+
+	if status.LastTerminationState.Terminated != nil {
+		return status.LastTerminationState.Terminated.Reason
+	}
+
+	return ""
+}
+
+func containerLastExitCode(
+	status *corev1.ContainerStatus,
+) *int32 {
+	if status.State.Terminated != nil {
+		exitCode :=
+			status.State.Terminated.ExitCode
+
+		return &exitCode
+	}
+
+	if status.LastTerminationState.Terminated != nil {
+		exitCode :=
+			status.LastTerminationState.Terminated.ExitCode
+
+		return &exitCode
+	}
+
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Incident fingerprint
+// -----------------------------------------------------------------------------
+
+func buildIncidentFingerprint(
+	policy *opsv1alpha1.IncidentPolicy,
+	finding *incidentFinding,
+) string {
+	raw :=
+		fmt.Sprintf(
+			"%s|%s|%s|%s",
+			string(policy.UID),
+			finding.PodUID,
+			finding.ContainerName,
+			finding.IncidentType,
+		)
+
+	sum :=
+		sha256.Sum256(
+			[]byte(raw),
+		)
+
+	return fmt.Sprintf(
+		"%x",
+		sum,
+	)
+}
+
+func incidentReportName(
+	fingerprint string,
+) string {
+	const prefixLength = 16
+
+	if len(fingerprint) <= prefixLength {
+		return "incident-" + fingerprint
+	}
+
+	return "incident-" +
+		fingerprint[:prefixLength]
+}
+
+// -----------------------------------------------------------------------------
+// IncidentReport creation / retrieval
+//
+// The report name is deterministic.
+//
+// Concurrent reconciles may race:
+//
+// Reconcile A                   Reconcile B
+// GET -> NotFound               GET -> NotFound
+// CREATE -> success             CREATE -> AlreadyExists
+//
+// AlreadyExists is therefore recovered by re-reading the existing report.
 // -----------------------------------------------------------------------------
 
 func (r *IncidentPolicyReconciler) ensureIncidentReport(
@@ -651,7 +1002,7 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 	)
 
 	if err == nil {
-		// A deterministic report name should always represent the same
+		// A deterministic report name must always represent the same
 		// incident fingerprint.
 		if report.Spec.Fingerprint != fingerprint {
 			return fmt.Errorf(
@@ -670,9 +1021,6 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 	}
 
 	if !apierrors.IsNotFound(err) {
-		// API failures such as timeout, connection failure, or authorization
-		// errors are returned to controller-runtime so its workqueue can retry
-		// using rate-limited backoff.
 		return fmt.Errorf(
 			"get IncidentReport %s/%s: %w",
 			policy.Namespace,
@@ -686,26 +1034,18 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 			Name:      reportName,
 			Namespace: policy.Namespace,
 			Labels: map[string]string{
-				reportPolicyUIDLabel: string(policy.UID),
-
+				reportPolicyUIDLabel:    string(policy.UID),
 				reportIncidentTypeLabel: finding.IncidentType,
 			},
 		},
-
 		Spec: opsv1alpha1.IncidentReportSpec{
-			PolicyName: policy.Name,
-
-			PolicyUID: string(policy.UID),
-
-			PodName: finding.PodName,
-
-			PodUID: finding.PodUID,
-
+			PolicyName:    policy.Name,
+			PolicyUID:     string(policy.UID),
+			PodName:       finding.PodName,
+			PodUID:        finding.PodUID,
 			ContainerName: finding.ContainerName,
-
-			IncidentType: finding.IncidentType,
-
-			Fingerprint: fingerprint,
+			IncidentType:  finding.IncidentType,
+			Fingerprint:   fingerprint,
 		},
 	}
 
@@ -724,11 +1064,8 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 			)
 		}
 
-		// Another reconcile created the deterministic IncidentReport after
-		// our initial GET returned NotFound.
-		//
-		// Re-read it and continue instead of treating AlreadyExists as an
-		// incident-processing failure.
+		// Another reconciliation created the deterministic report after
+		// our original GET returned NotFound.
 		report = &opsv1alpha1.IncidentReport{}
 
 		if getErr := r.Get(
@@ -752,6 +1089,14 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 				report.Spec.Fingerprint,
 			)
 		}
+	} else {
+		// A new IncidentReport was actually created by this reconciliation.
+		//
+		// Repeated reconciliations will GET the existing report and will not
+		// increment this metric again.
+		incidentReportTransitionsTotal.WithLabelValues(
+			"created",
+		).Inc()
 	}
 
 	return r.updateIncidentReportStatus(
@@ -770,25 +1115,42 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	report *opsv1alpha1.IncidentReport,
 	finding *incidentFinding,
 ) error {
-	log := logf.FromContext(ctx)
+	log :=
+		logf.FromContext(
+			ctx,
+		)
 
-	before := report.DeepCopy()
+	before :=
+		report.DeepCopy()
 
-	now := metav1.Now()
+	now :=
+		metav1.Now()
 
 	if report.Status.FirstDetectedAt == nil {
-		firstDetected := now
-		report.Status.FirstDetectedAt = &firstDetected
+		firstDetected :=
+			now
+
+		report.Status.FirstDetectedAt =
+			&firstDetected
 	}
 
-	lastObserved := now
-	report.Status.LastObservedAt = &lastObserved
+	lastObserved :=
+		now
 
-	report.Status.Phase = "Active"
-	report.Status.ResolvedAt = nil
+	report.Status.LastObservedAt =
+		&lastObserved
+
+	report.Status.Phase =
+		"Active"
+
+	report.Status.ResolvedAt =
+		nil
 
 	// -----------------------------------------------------------------
 	// Pod/container evidence.
+	//
+	// Failure here is supplemental. Detector-derived evidence remains
+	// available and the incident is still recorded.
 	// -----------------------------------------------------------------
 
 	evidence, podEvidenceErr :=
@@ -799,6 +1161,15 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 		)
 
 	if podEvidenceErr != nil {
+		// -------------------------------------------------------------
+		// Phase 6.2D:
+		// Evidence collection failure metric.
+		// -------------------------------------------------------------
+
+		evidenceCollectionFailuresTotal.WithLabelValues(
+			"pod",
+		).Inc()
+
 		log.Error(
 			podEvidenceErr,
 			"failed to collect Pod/container evidence",
@@ -813,6 +1184,8 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 
 	// -----------------------------------------------------------------
 	// Kubernetes Event evidence.
+	//
+	// If refresh fails, retain the previously collected Events.
 	// -----------------------------------------------------------------
 
 	eventEvidence, eventErr :=
@@ -823,6 +1196,15 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 		)
 
 	if eventErr != nil {
+		// -------------------------------------------------------------
+		// Phase 6.2D:
+		// Evidence collection failure metric.
+		// -------------------------------------------------------------
+
+		evidenceCollectionFailuresTotal.WithLabelValues(
+			"event",
+		).Inc()
+
 		log.Error(
 			eventErr,
 			"failed to collect Kubernetes Event evidence",
@@ -842,13 +1224,13 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	// -----------------------------------------------------------------
 	// Bounded container logs.
 	//
-	// Logs are supplemental. A log failure never invalidates the primary
-	// incident.
+	// Log evidence is supplemental. Failure must never invalidate the
+	// primary incident.
 	// -----------------------------------------------------------------
 
 	if r.LogReader == nil {
-		// This occurs in envtest unless a fake LogReader is explicitly
-		// injected. Preserve previously collected logs.
+		// envtest does not have a kubelet log endpoint unless a fake reader
+		// is explicitly injected.
 		evidence.Logs =
 			before.Status.Evidence.Logs
 	} else {
@@ -860,6 +1242,15 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 			)
 
 		if logErr != nil {
+			// ---------------------------------------------------------
+			// Phase 6.2D:
+			// Evidence collection failure metric.
+			// ---------------------------------------------------------
+
+			evidenceCollectionFailuresTotal.WithLabelValues(
+				"log",
+			).Inc()
+
 			log.Error(
 				logErr,
 				"failed to collect some container log evidence",
@@ -873,12 +1264,14 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 		}
 
 		if logEvidence.CollectedAt != nil {
-			// At least one log read succeeded.
+			// At least one log request succeeded.
 			evidence.Logs =
 				logEvidence
 		} else if logErr != nil {
-			// Every requested log read failed. Preserve older log evidence
-			// rather than replacing useful history with an empty value.
+			// Every requested log read failed.
+			//
+			// Preserve older evidence instead of replacing useful history
+			// with an empty structure.
 			evidence.Logs =
 				before.Status.Evidence.Logs
 		}
@@ -894,26 +1287,27 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 		return nil
 	}
 
-	return r.Status().Patch(
-		ctx,
-		report,
-		client.MergeFrom(before),
-	)
+	if err :=
+		r.Status().Patch(
+			ctx,
+			report,
+			client.MergeFrom(before),
+		); err != nil {
+
+		return fmt.Errorf(
+			"patch IncidentReport status %s/%s: %w",
+			report.Namespace,
+			report.Name,
+			err,
+		)
+	}
+
+	return nil
 }
 
 // -----------------------------------------------------------------------------
-// Independent IncidentReport resolution
+// Resolve IncidentReports that are no longer observed
 // -----------------------------------------------------------------------------
-
-// resolveUnobservedIncidentReports compares existing Active IncidentReports
-// against the fingerprints that were actually observed during the current
-// reconciliation.
-//
-// Observed report:
-//     remains Active.
-//
-// Active report that was NOT observed:
-//     becomes Resolved.
 
 func (r *IncidentPolicyReconciler) resolveUnobservedIncidentReports(
 	ctx context.Context,
@@ -930,39 +1324,33 @@ func (r *IncidentPolicyReconciler) resolveUnobservedIncidentReports(
 			reportPolicyUIDLabel: string(policy.UID),
 		},
 	); err != nil {
-		return err
+		return fmt.Errorf(
+			"list IncidentReports for IncidentPolicy %s/%s: %w",
+			policy.Namespace,
+			policy.Name,
+			err,
+		)
 	}
-
-	now := metav1.Now()
 
 	for i := range reports.Items {
 		report := &reports.Items[i]
 
-		// Only Active reports need lifecycle evaluation.
+		// Only Active reports can transition to Resolved.
 		if report.Status.Phase != "Active" {
 			continue
 		}
 
-		// If this fingerprint was observed during the current
-		// reconciliation, the incident still exists.
-		if _, observed := observedFingerprints[report.Spec.Fingerprint]; observed {
+		// The incident is still present during this reconciliation.
+		if _, stillObserved := observedFingerprints[report.Spec.Fingerprint]; stillObserved {
 			continue
 		}
 
-		// This report was Active previously but was not observed
-		// during this reconciliation, so the incident has resolved.
 		before := report.DeepCopy()
 
+		now := metav1.Now()
+
 		report.Status.Phase = "Resolved"
-
-		resolvedAt := now
-		report.Status.ResolvedAt = &resolvedAt
-
-		// Preserve historical information:
-		//
-		// FirstDetectedAt
-		// LastObservedAt
-		// Evidence
+		report.Status.ResolvedAt = &now
 
 		if reflect.DeepEqual(
 			before.Status,
@@ -976,113 +1364,37 @@ func (r *IncidentPolicyReconciler) resolveUnobservedIncidentReports(
 			report,
 			client.MergeFrom(before),
 		); err != nil {
-			return err
+			return fmt.Errorf(
+				"resolve IncidentReport %s/%s: %w",
+				report.Namespace,
+				report.Name,
+				err,
+			)
 		}
+
+		// Count the transition only after the status update succeeds.
+		//
+		// On the next reconciliation this report is already Resolved,
+		// therefore it cannot increment the metric again.
+		incidentReportTransitionsTotal.WithLabelValues(
+			"resolved",
+		).Inc()
 	}
 
 	return nil
 }
 
 // -----------------------------------------------------------------------------
-// Incident fingerprint
-// -----------------------------------------------------------------------------
-
-func buildIncidentFingerprint(
-	policy *opsv1alpha1.IncidentPolicy,
-	finding *incidentFinding,
-) string {
-	raw := fmt.Sprintf(
-		"%s|%s|%s|%s",
-		string(policy.UID),
-		finding.PodUID,
-		finding.ContainerName,
-		finding.IncidentType,
-	)
-
-	hash :=
-		sha256.Sum256(
-			[]byte(raw),
-		)
-
-	return fmt.Sprintf(
-		"%x",
-		hash,
-	)
-}
-
-// incidentReportName converts the fingerprint into a short deterministic
-// Kubernetes resource name.
-func incidentReportName(
-	fingerprint string,
-) string {
-	const fingerprintLength = 16
-
-	short := fingerprint
-
-	if len(short) > fingerprintLength {
-		short =
-			short[:fingerprintLength]
-	}
-
-	return "incident-" + short
-}
-
-// -----------------------------------------------------------------------------
-// Container state helper
-// -----------------------------------------------------------------------------
-
-func containerStateName(
-	state corev1.ContainerState,
-) string {
-	switch {
-	case state.Waiting != nil:
-		return "Waiting"
-
-	case state.Running != nil:
-		return "Running"
-
-	case state.Terminated != nil:
-		return "Terminated"
-
-	default:
-		return "Unknown"
-	}
-}
-
-// -----------------------------------------------------------------------------
-// IncidentPolicy status helper
-// -----------------------------------------------------------------------------
-
-func (r *IncidentPolicyReconciler) updatePolicyStatusIfChanged(
-	ctx context.Context,
-	before *opsv1alpha1.IncidentPolicy,
-	after *opsv1alpha1.IncidentPolicy,
-) error {
-	if reflect.DeepEqual(
-		before.Status,
-		after.Status,
-	) {
-		return nil
-	}
-
-	return r.Status().Patch(
-		ctx,
-		after,
-		client.MergeFrom(before),
-	)
-}
-
-// -----------------------------------------------------------------------------
-// Pod event mapping
+// Pod -> IncidentPolicy event mapping
+//
+// A Pod update should reconcile every IncidentPolicy in the same namespace
+// whose selector matches that Pod.
 // -----------------------------------------------------------------------------
 
 func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	ctx context.Context,
 	obj client.Object,
 ) []reconcile.Request {
-	log :=
-		logf.FromContext(ctx)
-
 	pod, ok :=
 		obj.(*corev1.Pod)
 
@@ -1093,16 +1405,18 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	policies :=
 		&opsv1alpha1.IncidentPolicyList{}
 
-	if err := r.List(
-		ctx,
-		policies,
-		client.InNamespace(
-			pod.Namespace,
-		),
-	); err != nil {
-		log.Error(
+	if err :=
+		r.List(
+			ctx,
+			policies,
+			client.InNamespace(
+				pod.Namespace,
+			),
+		); err != nil {
+
+		logf.FromContext(ctx).Error(
 			err,
-			"failed to list IncidentPolicies for Pod event",
+			"failed to list IncidentPolicies while mapping Pod event",
 			"pod",
 			pod.Name,
 			"namespace",
@@ -1115,6 +1429,11 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 	requests :=
 		make([]reconcile.Request, 0)
 
+	podLabels :=
+		labels.Set(
+			pod.Labels,
+		)
+
 	for i := range policies.Items {
 		policy :=
 			&policies.Items[i]
@@ -1125,22 +1444,11 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 			)
 
 		if err != nil {
-			log.Error(
-				err,
-				"failed to convert IncidentPolicy selector",
-				"policy",
-				policy.Name,
-				"namespace",
-				policy.Namespace,
-			)
-
 			continue
 		}
 
 		if !selector.Matches(
-			labels.Set(
-				pod.Labels,
-			),
+			podLabels,
 		) {
 			continue
 		}
@@ -1161,12 +1469,32 @@ func (r *IncidentPolicyReconciler) mapPodToIncidentPolicies(
 }
 
 // -----------------------------------------------------------------------------
-// Controller registration
+// Controller setup
 // -----------------------------------------------------------------------------
 
 func (r *IncidentPolicyReconciler) SetupWithManager(
 	mgr ctrl.Manager,
 ) error {
+	// Production receives the real Kubernetes Pod log reader.
+	//
+	// Tests can inject a fake reader before SetupWithManager if needed.
+	if r.LogReader == nil {
+		logReader, err :=
+			newKubernetesLogReader(
+				mgr.GetConfig(),
+			)
+
+		if err != nil {
+			return fmt.Errorf(
+				"initialize Kubernetes log reader: %w",
+				err,
+			)
+		}
+
+		r.LogReader =
+			logReader
+	}
+
 	return ctrl.NewControllerManagedBy(
 		mgr,
 	).
