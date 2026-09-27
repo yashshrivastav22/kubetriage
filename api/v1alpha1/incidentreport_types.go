@@ -36,9 +36,7 @@ type IncidentEventEvidence struct {
 	// +optional
 	Action string `json:"action,omitempty"`
 
-	// Note contains the human-readable Event description.
-	//
-	// KubeTriage bounds this field before storing it.
+	// Note contains the bounded human-readable Event description.
 	// +kubebuilder:validation:MaxLength=1024
 	// +optional
 	Note string `json:"note,omitempty"`
@@ -60,6 +58,45 @@ type IncidentEventEvidence struct {
 	ReportingController string `json:"reportingController,omitempty"`
 }
 
+// IncidentLogEvidence contains bounded log excerpts for the affected
+// container.
+//
+// KubeTriage intentionally stores only small diagnostic tails rather than
+// complete container logs.
+type IncidentLogEvidence struct {
+	// Current contains a bounded excerpt from the current container instance.
+	//
+	// The collector requests only the most recent lines and also enforces a
+	// maximum byte limit.
+	//
+	// +kubebuilder:validation:MaxLength=16384
+	// +optional
+	Current string `json:"current,omitempty"`
+
+	// Previous contains a bounded excerpt from the previous terminated
+	// container instance when Kubernetes makes previous logs available.
+	//
+	// This is especially useful for repeatedly restarting containers.
+	//
+	// +kubebuilder:validation:MaxLength=16384
+	// +optional
+	Previous string `json:"previous,omitempty"`
+
+	// CurrentTruncated indicates that the current log excerpt reached the
+	// KubeTriage storage limit.
+	// +optional
+	CurrentTruncated bool `json:"currentTruncated,omitempty"`
+
+	// PreviousTruncated indicates that the previous log excerpt reached the
+	// KubeTriage storage limit.
+	// +optional
+	PreviousTruncated bool `json:"previousTruncated,omitempty"`
+
+	// CollectedAt records when KubeTriage attempted log collection.
+	// +optional
+	CollectedAt *metav1.Time `json:"collectedAt,omitempty"`
+}
+
 // IncidentEvidence contains bounded Kubernetes evidence associated with an
 // incident.
 type IncidentEvidence struct {
@@ -68,15 +105,10 @@ type IncidentEvidence struct {
 	NodeName string `json:"nodeName,omitempty"`
 
 	// ConfiguredImage is the image declared in the Pod specification.
-	//
-	// Example:
-	// checkout:v2.4.1
 	// +optional
 	ConfiguredImage string `json:"configuredImage,omitempty"`
 
 	// RuntimeImage is the image name reported by ContainerStatus.
-	//
-	// This can differ from the value originally declared in the Pod spec.
 	// +optional
 	RuntimeImage string `json:"runtimeImage,omitempty"`
 
@@ -84,10 +116,7 @@ type IncidentEvidence struct {
 	// +optional
 	ImageID string `json:"imageID,omitempty"`
 
-	// ContainerID identifies the running or terminated container instance.
-	//
-	// Example:
-	// containerd://abc123
+	// ContainerID identifies the affected container instance.
 	// +optional
 	ContainerID string `json:"containerID,omitempty"`
 
@@ -96,28 +125,14 @@ type IncidentEvidence struct {
 	RestartCount int32 `json:"restartCount,omitempty"`
 
 	// CurrentState describes the current container state.
-	//
-	// Expected values include:
-	// Waiting
-	// Running
-	// Terminated
-	// Unknown
 	// +optional
 	CurrentState string `json:"currentState,omitempty"`
 
 	// WaitingReason contains the Kubernetes waiting reason when applicable.
-	//
-	// Examples:
-	// CrashLoopBackOff
-	// ErrImagePull
-	// ImagePullBackOff
 	// +optional
 	WaitingReason string `json:"waitingReason,omitempty"`
 
 	// LastTerminationReason contains the termination reason when available.
-	//
-	// Example:
-	// OOMKilled
 	// +optional
 	LastTerminationReason string `json:"lastTerminationReason,omitempty"`
 
@@ -125,8 +140,7 @@ type IncidentEvidence struct {
 	// +optional
 	ExitCode *int32 `json:"exitCode,omitempty"`
 
-	// Signal contains the signal associated with container termination when
-	// Kubernetes reports one.
+	// Signal contains the termination signal when Kubernetes reports one.
 	// +optional
 	Signal *int32 `json:"signal,omitempty"`
 
@@ -138,20 +152,21 @@ type IncidentEvidence struct {
 	// +optional
 	TerminationFinishedAt *metav1.Time `json:"terminationFinishedAt,omitempty"`
 
-	// TerminationMessage contains bounded termination information reported by
-	// Kubernetes.
-	//
+	// TerminationMessage contains bounded termination information.
 	// +kubebuilder:validation:MaxLength=1024
 	// +optional
 	TerminationMessage string `json:"terminationMessage,omitempty"`
 
 	// Events contains a bounded set of Kubernetes Events related to the
 	// affected Pod.
-	//
 	// +kubebuilder:validation:MaxItems=10
 	// +listType=atomic
 	// +optional
 	Events []IncidentEventEvidence `json:"events,omitempty"`
+
+	// Logs contains bounded log excerpts from the affected container.
+	// +optional
+	Logs IncidentLogEvidence `json:"logs,omitempty"`
 }
 
 // IncidentReportSpec defines the stable identity of a detected incident.

@@ -169,28 +169,14 @@ spec:
                   incident.
                 properties:
                   configuredImage:
-                    description: |-
-                      ConfiguredImage is the image declared in the Pod specification.
-
-                      Example:
-                      checkout:v2.4.1
+                    description: ConfiguredImage is the image declared in the Pod
+                      specification.
                     type: string
                   containerID:
-                    description: |-
-                      ContainerID identifies the running or terminated container instance.
-
-                      Example:
-                      containerd://abc123
+                    description: ContainerID identifies the affected container instance.
                     type: string
                   currentState:
-                    description: |-
-                      CurrentState describes the current container state.
-
-                      Expected values include:
-                      Waiting
-                      Running
-                      Terminated
-                      Unknown
+                    description: CurrentState describes the current container state.
                     type: string
                   events:
                     description: |-
@@ -221,10 +207,8 @@ spec:
                           format: date-time
                           type: string
                         note:
-                          description: |-
-                            Note contains the human-readable Event description.
-
-                            KubeTriage bounds this field before storing it.
+                          description: Note contains the bounded human-readable Event
+                            description.
                           maxLength: 1024
                           type: string
                         reason:
@@ -252,12 +236,45 @@ spec:
                       container runtime.
                     type: string
                   lastTerminationReason:
-                    description: |-
-                      LastTerminationReason contains the termination reason when available.
-
-                      Example:
-                      OOMKilled
+                    description: LastTerminationReason contains the termination reason
+                      when available.
                     type: string
+                  logs:
+                    description: Logs contains bounded log excerpts from the affected
+                      container.
+                    properties:
+                      collectedAt:
+                        description: CollectedAt records when KubeTriage attempted
+                          log collection.
+                        format: date-time
+                        type: string
+                      current:
+                        description: |-
+                          Current contains a bounded excerpt from the current container instance.
+
+                          The collector requests only the most recent lines and also enforces a
+                          maximum byte limit.
+                        maxLength: 16384
+                        type: string
+                      currentTruncated:
+                        description: |-
+                          CurrentTruncated indicates that the current log excerpt reached the
+                          KubeTriage storage limit.
+                        type: boolean
+                      previous:
+                        description: |-
+                          Previous contains a bounded excerpt from the previous terminated
+                          container instance when Kubernetes makes previous logs available.
+
+                          This is especially useful for repeatedly restarting containers.
+                        maxLength: 16384
+                        type: string
+                      previousTruncated:
+                        description: |-
+                          PreviousTruncated indicates that the previous log excerpt reached the
+                          KubeTriage storage limit.
+                        type: boolean
+                    type: object
                   nodeName:
                     description: NodeName is the Kubernetes node assigned to the affected
                       Pod.
@@ -268,15 +285,11 @@ spec:
                     format: int32
                     type: integer
                   runtimeImage:
-                    description: |-
-                      RuntimeImage is the image name reported by ContainerStatus.
-
-                      This can differ from the value originally declared in the Pod spec.
+                    description: RuntimeImage is the image name reported by ContainerStatus.
                     type: string
                   signal:
-                    description: |-
-                      Signal contains the signal associated with container termination when
-                      Kubernetes reports one.
+                    description: Signal contains the termination signal when Kubernetes
+                      reports one.
                     format: int32
                     type: integer
                   terminationFinishedAt:
@@ -284,9 +297,7 @@ spec:
                     format: date-time
                     type: string
                   terminationMessage:
-                    description: |-
-                      TerminationMessage contains bounded termination information reported by
-                      Kubernetes.
+                    description: TerminationMessage contains bounded termination information.
                     maxLength: 1024
                     type: string
                   terminationStartedAt:
@@ -295,13 +306,8 @@ spec:
                     format: date-time
                     type: string
                   waitingReason:
-                    description: |-
-                      WaitingReason contains the Kubernetes waiting reason when applicable.
-
-                      Examples:
-                      CrashLoopBackOff
-                      ErrImagePull
-                      ImagePullBackOff
+                    description: WaitingReason contains the Kubernetes waiting reason
+                      when applicable.
                     type: string
                 type: object
               firstDetectedAt:

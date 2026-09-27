@@ -50,7 +50,8 @@ type incidentFinding struct {
 // IncidentPolicyReconciler reconciles an IncidentPolicy object.
 type IncidentPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	LogReader LogReader
 }
 
 // -----------------------------------------------------------------------------
@@ -62,6 +63,7 @@ type IncidentPolicyReconciler struct {
 // +kubebuilder:rbac:groups=ops.kubetriage.dev,resources=incidentreports,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=ops.kubetriage.dev,resources=incidentreports/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=get;list;watch
 
 func (r *IncidentPolicyReconciler) Reconcile(
@@ -633,17 +635,14 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 	finding *incidentFinding,
 	fingerprint string,
 ) error {
-	reportName := incidentReportName(
-		fingerprint,
-	)
+	reportName := incidentReportName(fingerprint)
 
 	key := types.NamespacedName{
 		Name:      reportName,
 		Namespace: policy.Namespace,
 	}
 
-	report :=
-		&opsv1alpha1.IncidentReport{}
+	report := &opsv1alpha1.IncidentReport{}
 
 	err := r.Get(
 		ctx,
@@ -651,54 +650,108 @@ func (r *IncidentPolicyReconciler) ensureIncidentReport(
 		report,
 	)
 
-	if apierrors.IsNotFound(err) {
-		report =
-			&opsv1alpha1.IncidentReport{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: reportName,
+	if err == nil {
+		// A deterministic report name should always represent the same
+		// incident fingerprint.
+		if report.Spec.Fingerprint != fingerprint {
+			return fmt.Errorf(
+				"IncidentReport name collision for %s: expected fingerprint %s, found %s",
+				reportName,
+				fingerprint,
+				report.Spec.Fingerprint,
+			)
+		}
 
-					Namespace: policy.Namespace,
-
-					Labels: map[string]string{
-						reportPolicyUIDLabel: string(policy.UID),
-
-						reportIncidentTypeLabel: finding.IncidentType,
-					},
-				},
-
-				Spec: opsv1alpha1.IncidentReportSpec{
-					PolicyName: policy.Name,
-
-					PolicyUID: string(policy.UID),
-
-					PodName: finding.PodName,
-
-					PodUID: finding.PodUID,
-
-					ContainerName: finding.ContainerName,
-
-					IncidentType: finding.IncidentType,
-
-					Fingerprint: fingerprint,
-				},
-			}
-
-		if err := r.Create(
+		return r.updateIncidentReportStatus(
 			ctx,
 			report,
-		); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
+			finding,
+		)
 	}
 
-	// Defensive fingerprint collision check.
-	if report.Spec.Fingerprint != fingerprint {
+	if !apierrors.IsNotFound(err) {
+		// API failures such as timeout, connection failure, or authorization
+		// errors are returned to controller-runtime so its workqueue can retry
+		// using rate-limited backoff.
 		return fmt.Errorf(
-			"incident report name collision: report %s has unexpected fingerprint",
-			report.Name,
+			"get IncidentReport %s/%s: %w",
+			policy.Namespace,
+			reportName,
+			err,
 		)
+	}
+
+	report = &opsv1alpha1.IncidentReport{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      reportName,
+			Namespace: policy.Namespace,
+			Labels: map[string]string{
+				reportPolicyUIDLabel: string(policy.UID),
+
+				reportIncidentTypeLabel: finding.IncidentType,
+			},
+		},
+
+		Spec: opsv1alpha1.IncidentReportSpec{
+			PolicyName: policy.Name,
+
+			PolicyUID: string(policy.UID),
+
+			PodName: finding.PodName,
+
+			PodUID: finding.PodUID,
+
+			ContainerName: finding.ContainerName,
+
+			IncidentType: finding.IncidentType,
+
+			Fingerprint: fingerprint,
+		},
+	}
+
+	err = r.Create(
+		ctx,
+		report,
+	)
+
+	if err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf(
+				"create IncidentReport %s/%s: %w",
+				policy.Namespace,
+				reportName,
+				err,
+			)
+		}
+
+		// Another reconcile created the deterministic IncidentReport after
+		// our initial GET returned NotFound.
+		//
+		// Re-read it and continue instead of treating AlreadyExists as an
+		// incident-processing failure.
+		report = &opsv1alpha1.IncidentReport{}
+
+		if getErr := r.Get(
+			ctx,
+			key,
+			report,
+		); getErr != nil {
+			return fmt.Errorf(
+				"get concurrently created IncidentReport %s/%s: %w",
+				policy.Namespace,
+				reportName,
+				getErr,
+			)
+		}
+
+		if report.Spec.Fingerprint != fingerprint {
+			return fmt.Errorf(
+				"IncidentReport name collision for %s: expected fingerprint %s, found %s",
+				reportName,
+				fingerprint,
+				report.Spec.Fingerprint,
+			)
+		}
 	}
 
 	return r.updateIncidentReportStatus(
@@ -735,11 +788,7 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	report.Status.ResolvedAt = nil
 
 	// -----------------------------------------------------------------
-	// Collect richer Pod/container evidence.
-	//
-	// Failure to enrich evidence must NOT cause us to lose the primary
-	// incident. The detector finding remains authoritative for the
-	// incident observation.
+	// Pod/container evidence.
 	// -----------------------------------------------------------------
 
 	evidence, podEvidenceErr :=
@@ -763,10 +812,7 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 	}
 
 	// -----------------------------------------------------------------
-	// Collect Kubernetes Event evidence.
-	//
-	// Events are also supplemental. Failure to read Events must not
-	// invalidate the detected incident.
+	// Kubernetes Event evidence.
 	// -----------------------------------------------------------------
 
 	eventEvidence, eventErr :=
@@ -786,13 +832,56 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 			finding.PodName,
 		)
 
-		// Preserve previously collected Event evidence when the Event API
-		// is temporarily unavailable.
 		evidence.Events =
 			before.Status.Evidence.Events
 	} else {
 		evidence.Events =
 			eventEvidence
+	}
+
+	// -----------------------------------------------------------------
+	// Bounded container logs.
+	//
+	// Logs are supplemental. A log failure never invalidates the primary
+	// incident.
+	// -----------------------------------------------------------------
+
+	if r.LogReader == nil {
+		// This occurs in envtest unless a fake LogReader is explicitly
+		// injected. Preserve previously collected logs.
+		evidence.Logs =
+			before.Status.Evidence.Logs
+	} else {
+		logEvidence, logErr :=
+			r.collectContainerLogEvidence(
+				ctx,
+				report.Namespace,
+				finding,
+			)
+
+		if logErr != nil {
+			log.Error(
+				logErr,
+				"failed to collect some container log evidence",
+				"incidentReport",
+				report.Name,
+				"pod",
+				finding.PodName,
+				"container",
+				finding.ContainerName,
+			)
+		}
+
+		if logEvidence.CollectedAt != nil {
+			// At least one log read succeeded.
+			evidence.Logs =
+				logEvidence
+		} else if logErr != nil {
+			// Every requested log read failed. Preserve older log evidence
+			// rather than replacing useful history with an empty value.
+			evidence.Logs =
+				before.Status.Evidence.Logs
+		}
 	}
 
 	report.Status.Evidence =
