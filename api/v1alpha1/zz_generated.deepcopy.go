@@ -71,6 +71,19 @@ func (in *IncidentEvidence) DeepCopyInto(out *IncidentEvidence) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.Signal != nil {
+		in, out := &in.Signal, &out.Signal
+		*out = new(int32)
+		**out = **in
+	}
+	if in.TerminationStartedAt != nil {
+		in, out := &in.TerminationStartedAt, &out.TerminationStartedAt
+		*out = (*in).DeepCopy()
+	}
+	if in.TerminationFinishedAt != nil {
+		in, out := &in.TerminationFinishedAt, &out.TerminationFinishedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.Events != nil {
 		in, out := &in.Events, &out.Events
 		*out = make([]IncidentEventEvidence, len(*in))

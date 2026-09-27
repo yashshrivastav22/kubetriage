@@ -58,11 +58,9 @@ spec:
                 type: string
               fingerprint:
                 description: |-
-                  Fingerprint is the stable identity used by KubeTriage to avoid
-                  duplicate reports for the same incident.
+                  Fingerprint is the stable identity used to prevent duplicate reports.
 
-                  It is derived from:
-
+                  Derived from:
                   Policy UID
                   Pod UID
                   Container name
@@ -103,12 +101,10 @@ spec:
             - policyUID
             type: object
           status:
-            description: status defines the observed lifecycle and evidence for the
-              incident.
+            description: status defines lifecycle and evidence.
             properties:
               conditions:
-                description: Conditions represent additional lifecycle state for this
-                  report.
+                description: Conditions represent additional lifecycle state.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -170,37 +166,48 @@ spec:
               evidence:
                 description: |-
                   Evidence contains bounded Kubernetes evidence associated with the
-                  most recent observation.
+                  incident.
                 properties:
+                  configuredImage:
+                    description: |-
+                      ConfiguredImage is the image declared in the Pod specification.
+
+                      Example:
+                      checkout:v2.4.1
+                    type: string
+                  containerID:
+                    description: |-
+                      ContainerID identifies the running or terminated container instance.
+
+                      Example:
+                      containerd://abc123
+                    type: string
                   currentState:
                     description: |-
-                      CurrentState describes the current container state when the incident
-                      was last evaluated.
+                      CurrentState describes the current container state.
+
+                      Expected values include:
+                      Waiting
+                      Running
+                      Terminated
+                      Unknown
                     type: string
                   events:
                     description: |-
                       Events contains a bounded set of Kubernetes Events related to the
                       affected Pod.
-
-                      KubeTriage intentionally limits this collection so IncidentReport
-                      objects cannot grow without bound.
                     items:
                       description: |-
                         IncidentEventEvidence represents bounded Kubernetes Event evidence collected
                         for the Pod involved in an incident.
-
-                        Events are supplemental evidence. They should not be treated as the sole
-                        source of truth because Kubernetes Events have limited retention.
                       properties:
                         action:
                           description: Action describes the action reported by the
                             Event producer.
                           type: string
                         count:
-                          description: |-
-                            Count represents how many times this Event occurred when Kubernetes
-                            reports it as an Event series.
-                            Singleton Events are represented with count 1.
+                          description: Count represents how many times this Event
+                            occurred.
                           format: int32
                           type: integer
                         firstObservedAt:
@@ -209,9 +216,8 @@ spec:
                           format: date-time
                           type: string
                         lastObservedAt:
-                          description: |-
-                            LastObservedAt represents the most recent observation of an Event
-                            series when available.
+                          description: LastObservedAt represents the most recent observation
+                            of the Event.
                           format: date-time
                           type: string
                         note:
@@ -222,21 +228,12 @@ spec:
                           maxLength: 1024
                           type: string
                         reason:
-                          description: |-
-                            Reason is the machine-readable Kubernetes Event reason.
-
-                            Examples:
-                            BackOff
-                            Failed
-                            Pulling
-                            FailedScheduling
+                          description: Reason is the machine-readable Kubernetes Event
+                            reason.
                           type: string
                         reportingController:
-                          description: |-
-                            ReportingController identifies the component that reported the Event.
-
-                            Example:
-                            kubernetes.io/kubelet
+                          description: ReportingController identifies the component
+                            that reported the Event.
                           type: string
                         type:
                           description: Type is normally Normal or Warning.
@@ -246,23 +243,57 @@ spec:
                     type: array
                     x-kubernetes-list-type: atomic
                   exitCode:
-                    description: ExitCode contains the previous container exit code
-                      when available.
+                    description: ExitCode contains the container termination exit
+                      code when available.
                     format: int32
                     type: integer
+                  imageID:
+                    description: ImageID identifies the exact image reported by the
+                      container runtime.
+                    type: string
                   lastTerminationReason:
                     description: |-
-                      LastTerminationReason contains the previous container termination
-                      reason when available.
+                      LastTerminationReason contains the termination reason when available.
 
                       Example:
                       OOMKilled
+                    type: string
+                  nodeName:
+                    description: NodeName is the Kubernetes node assigned to the affected
+                      Pod.
                     type: string
                   restartCount:
                     description: RestartCount is the restart count reported for the
                       affected container.
                     format: int32
                     type: integer
+                  runtimeImage:
+                    description: |-
+                      RuntimeImage is the image name reported by ContainerStatus.
+
+                      This can differ from the value originally declared in the Pod spec.
+                    type: string
+                  signal:
+                    description: |-
+                      Signal contains the signal associated with container termination when
+                      Kubernetes reports one.
+                    format: int32
+                    type: integer
+                  terminationFinishedAt:
+                    description: TerminationFinishedAt is when the container terminated.
+                    format: date-time
+                    type: string
+                  terminationMessage:
+                    description: |-
+                      TerminationMessage contains bounded termination information reported by
+                      Kubernetes.
+                    maxLength: 1024
+                    type: string
+                  terminationStartedAt:
+                    description: TerminationStartedAt is when the terminated container
+                      execution began.
+                    format: date-time
+                    type: string
                   waitingReason:
                     description: |-
                       WaitingReason contains the Kubernetes waiting reason when applicable.
@@ -279,9 +310,8 @@ spec:
                 format: date-time
                 type: string
               lastObservedAt:
-                description: |-
-                  LastObservedAt is the most recent time KubeTriage observed the
-                  incident condition.
+                description: LastObservedAt is the most recent time KubeTriage observed
+                  the incident.
                 format: date-time
                 type: string
               phase:

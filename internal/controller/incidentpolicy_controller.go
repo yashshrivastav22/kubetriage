@@ -719,34 +719,54 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 ) error {
 	log := logf.FromContext(ctx)
 
-	before :=
-		report.DeepCopy()
+	before := report.DeepCopy()
 
 	now := metav1.Now()
 
 	if report.Status.FirstDetectedAt == nil {
 		firstDetected := now
-
-		report.Status.FirstDetectedAt =
-			&firstDetected
+		report.Status.FirstDetectedAt = &firstDetected
 	}
 
 	lastObserved := now
+	report.Status.LastObservedAt = &lastObserved
 
-	report.Status.LastObservedAt =
-		&lastObserved
+	report.Status.Phase = "Active"
+	report.Status.ResolvedAt = nil
 
-	report.Status.Phase =
-		"Active"
+	// -----------------------------------------------------------------
+	// Collect richer Pod/container evidence.
+	//
+	// Failure to enrich evidence must NOT cause us to lose the primary
+	// incident. The detector finding remains authoritative for the
+	// incident observation.
+	// -----------------------------------------------------------------
 
-	report.Status.ResolvedAt =
-		nil
+	evidence, podEvidenceErr :=
+		r.collectPodContainerEvidence(
+			ctx,
+			report.Namespace,
+			finding,
+		)
+
+	if podEvidenceErr != nil {
+		log.Error(
+			podEvidenceErr,
+			"failed to collect Pod/container evidence",
+			"incidentReport",
+			report.Name,
+			"pod",
+			finding.PodName,
+			"container",
+			finding.ContainerName,
+		)
+	}
 
 	// -----------------------------------------------------------------
 	// Collect Kubernetes Event evidence.
 	//
-	// Events are supplemental evidence, so an Event API failure should
-	// not prevent the primary incident from being recorded.
+	// Events are also supplemental. Failure to read Events must not
+	// invalidate the detected incident.
 	// -----------------------------------------------------------------
 
 	eventEvidence, eventErr :=
@@ -766,26 +786,17 @@ func (r *IncidentPolicyReconciler) updateIncidentReportStatus(
 			finding.PodName,
 		)
 
-		// Preserve previously collected Event evidence if this particular
-		// Event lookup fails.
-		eventEvidence =
+		// Preserve previously collected Event evidence when the Event API
+		// is temporarily unavailable.
+		evidence.Events =
 			before.Status.Evidence.Events
+	} else {
+		evidence.Events =
+			eventEvidence
 	}
 
 	report.Status.Evidence =
-		opsv1alpha1.IncidentEvidence{
-			RestartCount: finding.RestartCount,
-
-			CurrentState: finding.CurrentState,
-
-			WaitingReason: finding.WaitingReason,
-
-			LastTerminationReason: finding.LastTerminationReason,
-
-			ExitCode: finding.ExitCode,
-
-			Events: eventEvidence,
-		}
+		evidence
 
 	if reflect.DeepEqual(
 		before.Status,

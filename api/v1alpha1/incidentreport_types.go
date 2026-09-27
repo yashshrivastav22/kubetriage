@@ -23,21 +23,12 @@ import (
 
 // IncidentEventEvidence represents bounded Kubernetes Event evidence collected
 // for the Pod involved in an incident.
-//
-// Events are supplemental evidence. They should not be treated as the sole
-// source of truth because Kubernetes Events have limited retention.
 type IncidentEventEvidence struct {
 	// Type is normally Normal or Warning.
 	// +optional
 	Type string `json:"type,omitempty"`
 
 	// Reason is the machine-readable Kubernetes Event reason.
-	//
-	// Examples:
-	// BackOff
-	// Failed
-	// Pulling
-	// FailedScheduling
 	// +optional
 	Reason string `json:"reason,omitempty"`
 
@@ -52,9 +43,7 @@ type IncidentEventEvidence struct {
 	// +optional
 	Note string `json:"note,omitempty"`
 
-	// Count represents how many times this Event occurred when Kubernetes
-	// reports it as an Event series.
-	// Singleton Events are represented with count 1.
+	// Count represents how many times this Event occurred.
 	// +optional
 	Count int32 `json:"count,omitempty"`
 
@@ -62,28 +51,57 @@ type IncidentEventEvidence struct {
 	// +optional
 	FirstObservedAt *metav1.Time `json:"firstObservedAt,omitempty"`
 
-	// LastObservedAt represents the most recent observation of an Event
-	// series when available.
+	// LastObservedAt represents the most recent observation of the Event.
 	// +optional
 	LastObservedAt *metav1.Time `json:"lastObservedAt,omitempty"`
 
 	// ReportingController identifies the component that reported the Event.
-	//
-	// Example:
-	// kubernetes.io/kubelet
 	// +optional
 	ReportingController string `json:"reportingController,omitempty"`
 }
 
-// IncidentEvidence contains bounded Kubernetes evidence associated with
-// an incident.
+// IncidentEvidence contains bounded Kubernetes evidence associated with an
+// incident.
 type IncidentEvidence struct {
+	// NodeName is the Kubernetes node assigned to the affected Pod.
+	// +optional
+	NodeName string `json:"nodeName,omitempty"`
+
+	// ConfiguredImage is the image declared in the Pod specification.
+	//
+	// Example:
+	// checkout:v2.4.1
+	// +optional
+	ConfiguredImage string `json:"configuredImage,omitempty"`
+
+	// RuntimeImage is the image name reported by ContainerStatus.
+	//
+	// This can differ from the value originally declared in the Pod spec.
+	// +optional
+	RuntimeImage string `json:"runtimeImage,omitempty"`
+
+	// ImageID identifies the exact image reported by the container runtime.
+	// +optional
+	ImageID string `json:"imageID,omitempty"`
+
+	// ContainerID identifies the running or terminated container instance.
+	//
+	// Example:
+	// containerd://abc123
+	// +optional
+	ContainerID string `json:"containerID,omitempty"`
+
 	// RestartCount is the restart count reported for the affected container.
 	// +optional
 	RestartCount int32 `json:"restartCount,omitempty"`
 
-	// CurrentState describes the current container state when the incident
-	// was last evaluated.
+	// CurrentState describes the current container state.
+	//
+	// Expected values include:
+	// Waiting
+	// Running
+	// Terminated
+	// Unknown
 	// +optional
 	CurrentState string `json:"currentState,omitempty"`
 
@@ -96,23 +114,39 @@ type IncidentEvidence struct {
 	// +optional
 	WaitingReason string `json:"waitingReason,omitempty"`
 
-	// LastTerminationReason contains the previous container termination
-	// reason when available.
+	// LastTerminationReason contains the termination reason when available.
 	//
 	// Example:
 	// OOMKilled
 	// +optional
 	LastTerminationReason string `json:"lastTerminationReason,omitempty"`
 
-	// ExitCode contains the previous container exit code when available.
+	// ExitCode contains the container termination exit code when available.
 	// +optional
 	ExitCode *int32 `json:"exitCode,omitempty"`
 
+	// Signal contains the signal associated with container termination when
+	// Kubernetes reports one.
+	// +optional
+	Signal *int32 `json:"signal,omitempty"`
+
+	// TerminationStartedAt is when the terminated container execution began.
+	// +optional
+	TerminationStartedAt *metav1.Time `json:"terminationStartedAt,omitempty"`
+
+	// TerminationFinishedAt is when the container terminated.
+	// +optional
+	TerminationFinishedAt *metav1.Time `json:"terminationFinishedAt,omitempty"`
+
+	// TerminationMessage contains bounded termination information reported by
+	// Kubernetes.
+	//
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	TerminationMessage string `json:"terminationMessage,omitempty"`
+
 	// Events contains a bounded set of Kubernetes Events related to the
 	// affected Pod.
-	//
-	// KubeTriage intentionally limits this collection so IncidentReport
-	// objects cannot grow without bound.
 	//
 	// +kubebuilder:validation:MaxItems=10
 	// +listType=atomic
@@ -153,11 +187,9 @@ type IncidentReportSpec struct {
 	// +required
 	IncidentType string `json:"incidentType"`
 
-	// Fingerprint is the stable identity used by KubeTriage to avoid
-	// duplicate reports for the same incident.
+	// Fingerprint is the stable identity used to prevent duplicate reports.
 	//
-	// It is derived from:
-	//
+	// Derived from:
 	// Policy UID
 	// Pod UID
 	// Container name
@@ -180,8 +212,7 @@ type IncidentReportStatus struct {
 	// +optional
 	FirstDetectedAt *metav1.Time `json:"firstDetectedAt,omitempty"`
 
-	// LastObservedAt is the most recent time KubeTriage observed the
-	// incident condition.
+	// LastObservedAt is the most recent time KubeTriage observed the incident.
 	// +optional
 	LastObservedAt *metav1.Time `json:"lastObservedAt,omitempty"`
 
@@ -190,11 +221,11 @@ type IncidentReportStatus struct {
 	ResolvedAt *metav1.Time `json:"resolvedAt,omitempty"`
 
 	// Evidence contains bounded Kubernetes evidence associated with the
-	// most recent observation.
+	// incident.
 	// +optional
 	Evidence IncidentEvidence `json:"evidence,omitempty"`
 
-	// Conditions represent additional lifecycle state for this report.
+	// Conditions represent additional lifecycle state.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -218,7 +249,7 @@ type IncidentReport struct {
 	// +required
 	Spec IncidentReportSpec `json:"spec"`
 
-	// status defines the observed lifecycle and evidence for the incident.
+	// status defines lifecycle and evidence.
 	// +optional
 	Status IncidentReportStatus `json:"status,omitzero"`
 }
